@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/abolfazlalz/herald/internal/handshake"
@@ -21,6 +23,10 @@ const (
 	PeerTimeout = 5 * time.Second
 )
 
+type subscriber struct {
+	ch chan Message
+}
+
 type Herald struct {
 	transport  Transport
 	id         string
@@ -31,6 +37,11 @@ type Herald struct {
 	verifier security.Verifier
 	registry *registry.PeerRegistry
 
+	subs            map[MessageType][]chan Message
+	msgCh           chan Message
+	sendMessageChan chan Message
+	mu              sync.RWMutex
+
 	handlers map[message.EventType]handlerFunc
 }
 
@@ -38,14 +49,18 @@ func New(transport Transport, privateKey []byte) *Herald {
 	id := uuid.New().String()
 
 	h := &Herald{
-		transport:  transport,
-		id:         id,
-		privateKey: privateKey,
-		registry:   registry.NewPeerRegistry(),
+		transport:       transport,
+		id:              id,
+		privateKey:      privateKey,
+		registry:        registry.NewPeerRegistry(),
+		msgCh:           make(chan Message),
+		subs:            make(map[MessageType][]chan Message),
+		sendMessageChan: make(chan Message),
 	}
 	h.handlers = map[message.EventType]handlerFunc{
 		message.EventAnnounce:  handleAnnounce(),
 		message.EventHeartbeat: handleHeartbeat(),
+		message.EventMessage:   handleMessage(h.msgCh),
 	}
 	return h
 }
@@ -105,6 +120,18 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 	}
 }
 
+func (h *Herald) handleMessages(ctx context.Context) {
+	for {
+		select {
+		case msg := <-h.msgCh:
+			h.notify(msg.Type, msg)
+		case <-ctx.Done():
+			log.Println("message handler stopped:", ctx.Err())
+			return
+		}
+	}
+}
+
 func (h *Herald) publish(ctx context.Context, data any) error {
 	jsonB, err := json.Marshal(data)
 	if err != nil {
@@ -138,13 +165,13 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 		UpdateLastOnline(),
 	}
 
-	context := NewMessageContext(ctx)
+	msgCtx := NewMessageContext(ctx)
 
 	for _, middleware := range middlewares {
-		if context.IsAborted() {
+		if msgCtx.IsAborted() {
 			return nil
 		}
-		if err := middleware(context, h, &env); err != nil {
+		if err := middleware(msgCtx, h, &env); err != nil {
 			return fmt.Errorf("error in middleware: %v", err)
 		}
 	}
@@ -153,7 +180,7 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 	if !ok {
 		return errors.New("invalid event type")
 	}
-	if err := handler(context, h, &env); err != nil {
+	if err := handler(msgCtx, h, &env); err != nil {
 		return fmt.Errorf("error during handle envelope action: %v", err)
 	}
 	return nil
@@ -189,9 +216,95 @@ func (h *Herald) Start(ctx context.Context) error {
 	go h.startHeartbeatPublisher(ctx)
 	// check healthcheck
 	go h.startCheckHeartbeats(ctx)
+	// start message handler
+	go h.handleMessages(ctx)
+	// handle start send message
+	go h.handleSendMessages(ctx)
 
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+func (h *Herald) Send(ctx context.Context, msg Message) {
+	slog.Debug("Debug: send message")
+
+	env := message.NewEnvelope(message.EventMessage, h.ID(), msg.Payload)
+
+	if err := env.Sign(h.signer); err != nil {
+		slog.Error("message sign failed", "error", err)
+		return
+	}
+	if err := h.publish(ctx, env); err != nil {
+		slog.Error("message publish failed", "error", err)
+		return
+	}
+}
+
+func (h *Herald) handleSendMessages(ctx context.Context) {
+	for {
+		select {
+		case msg := <-h.sendMessageChan:
+			h.Send(ctx, msg)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (h *Herald) SendPayload(ctx context.Context, payload map[string]any) {
+	slog.Debug("Debug: send message")
+
+	h.sendMessageChan <- Message{
+		Type:    MessageTypeMessage,
+		Payload: payload,
+	}
+}
+
+func (h *Herald) SendMessage(ctx context.Context, msg string) {
+	payload := map[string]any{
+		"type":    MessageTypeMessage,
+		"service": h.ID(),
+		"message": msg,
+	}
+	h.SendPayload(ctx, payload)
+}
+
+func (h *Herald) Subscribe(
+	ctx context.Context,
+	event MessageType,
+	buffer int,
+) Subscription {
+
+	ch := make(chan Message, buffer)
+
+	h.mu.Lock()
+	h.subs[event] = append(h.subs[event], ch)
+	h.mu.Unlock()
+
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+
+	return Subscription{
+		C: ch,
+		cancel: func() {
+			close(ch)
+		},
+	}
+}
+
+func (h *Herald) notify(event MessageType, msg Message) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, sub := range h.subs[event] {
+		select {
+		case sub <- msg:
+		default:
+			// drop or log
+		}
+	}
 }
 
 func (h *Herald) ID() string {

@@ -27,6 +27,8 @@ func NewPeerRegistry() *PeerRegistry {
 }
 
 func (r *PeerRegistry) Exists(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	_, ok := r.peers[id]
 	return ok
 }

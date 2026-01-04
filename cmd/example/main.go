@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 
 	"github.com/abolfazlalz/herald"
-	"github.com/abolfazlalz/herald/internal/security"
 )
 
 type Data struct {
@@ -18,22 +21,50 @@ type Data struct {
 func main() {
 	transport, err := herald.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "events")
 	if err != nil {
-		log.Fatalf("error during connect to RabbitMQ: %v", err)
+		slog.Error("error during connect to RabbitMQ", "error", err)
 	}
-	defer func() {
-		transport.Close()
-	}()
+	defer transport.Close()
+
+	_, pri, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		slog.Error("error during generate security", "error", err)
+	}
 
 	ctx := context.Background()
 
-	kv, err := security.Generate()
-	if err != nil {
-		log.Fatalf("error during generate security: %v", err)
-	}
+	h := herald.New(transport, pri)
+	fmt.Println("Cluster ID:", h.ID())
 
-	h := herald.New(transport, kv.Private)
-	fmt.Println("Cluster: ", h.ID())
-	if err := h.Start(ctx); err != nil {
-		log.Fatalf("error during listen to herald: %v", err)
+	go func() {
+		if err := h.Start(ctx); err != nil {
+			slog.Error("error during listen to herald", "error", err)
+		}
+	}()
+
+	go func() {
+		sub := h.Subscribe(ctx, herald.MessageTypeMessage, 0)
+		for msg := range sub.C {
+			fmt.Println("Received message:", msg.Payload["message"])
+		}
+	}()
+
+	fmt.Println("Type message and press Enter (type `exit` to quit):")
+
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		text, err := reader.ReadString('\n')
+		if err != nil {
+			slog.Error("read error", "error", err)
+			continue
+		}
+
+		text = text[:len(text)-1] // remove \n
+
+		if text == "exit" {
+			break
+		}
+
+		h.SendMessage(ctx, text)
 	}
 }

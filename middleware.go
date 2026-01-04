@@ -1,8 +1,8 @@
 package herald
 
 import (
-	"errors"
-	"log"
+	"fmt"
+	"log/slog"
 
 	"github.com/abolfazlalz/herald/internal/message"
 )
@@ -18,16 +18,18 @@ func UpdateLastOnline() Middleware {
 
 func VerifySignature() Middleware {
 	return func(ctx *MessageContext, h *Herald, env *message.Envelope) error {
-		if env.Type != message.EventAnnounce {
-			peer, ok := h.registry.PeerByID(env.SenderID)
-			if !ok {
-				ctx.Abort()
-				log.Printf("unknown peer %s", env.SenderID)
-				return nil
-			}
-			if err := env.Verify(h.verifier, peer.PublicKey); err != nil {
-				return errors.New("signature verification failed")
-			}
+		if env.Type == message.EventAnnounce {
+			return nil
+		}
+		peer, ok := h.registry.PeerByID(env.SenderID)
+		if !ok {
+			ctx.Abort()
+			slog.Warn("unknown peer", "peer", env.SenderID)
+			return nil
+		}
+
+		if err := env.Verify(h.verifier, peer.PublicKey); err != nil {
+			return fmt.Errorf("signature verification failed: %v", err)
 		}
 		return nil
 	}

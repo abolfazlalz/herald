@@ -26,11 +26,7 @@ func InitiateHandshake(selfID string, kp *security.KeyPair, signer security.Sign
 // RespondHandshake verifies incoming Hello and stores peer public key
 func RespondHandshake(env *message.Envelope, verifier security.Verifier, registry *registry.PeerRegistry) error {
 	// extract pub_key from payload
-	payloadMap, ok := env.Payload.(map[string]any)
-	if !ok {
-		return fmt.Errorf("invalid payload")
-	}
-	pubKeyStr, ok := payloadMap["pub_key"].(string)
+	pubKeyStr, ok := env.Payload["pub_key"].(string)
 	if !ok {
 		return fmt.Errorf("pub_key missing")
 	}

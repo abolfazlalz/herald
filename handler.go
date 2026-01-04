@@ -32,3 +32,15 @@ func handleHeartbeat() handlerFunc {
 		return nil
 	}
 }
+
+func handleMessage(msgCh chan Message) handlerFunc {
+	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
+		msgCh <- Message{
+			From:    env.SenderID,
+			To:      h.ID(),
+			Type:    MessageTypeMessage,
+			Payload: env.Payload,
+		}
+		return nil
+	}
+}
