@@ -2,7 +2,6 @@ package herald
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 
@@ -11,8 +10,11 @@ import (
 )
 
 type RabbitMQ struct {
-	conn       *amqp.Connection
-	ch         *amqp.Channel
+	conn *amqp.Connection
+
+	pubCh  *amqp.Channel
+	consCh *amqp.Channel
+
 	exchange   string
 	consumerID string
 
@@ -32,13 +34,20 @@ func NewRabbitMQ(url, exchange string) (*RabbitMQ, error) {
 		return nil, err
 	}
 
-	ch, err := conn.Channel()
+	pubCh, err := conn.Channel()
 	if err != nil {
-		_ = conn.Close()
+		conn.Close()
 		return nil, err
 	}
 
-	if err := ch.ExchangeDeclare(
+	consCh, err := conn.Channel()
+	if err != nil {
+		pubCh.Close()
+		conn.Close()
+		return nil, err
+	}
+
+	if err := pubCh.ExchangeDeclare(
 		exchange,
 		"fanout",
 		true,
@@ -47,44 +56,35 @@ func NewRabbitMQ(url, exchange string) (*RabbitMQ, error) {
 		false,
 		nil,
 	); err != nil {
-		_ = ch.Close()
-		_ = conn.Close()
+		consCh.Close()
+		pubCh.Close()
+		conn.Close()
 		return nil, err
 	}
 
 	return &RabbitMQ{
 		conn:       conn,
-		ch:         ch,
+		pubCh:      pubCh,
+		consCh:     consCh,
 		exchange:   exchange,
 		consumerID: uuid.NewString(),
 	}, nil
 }
 
 func (mq *RabbitMQ) Publish(ctx context.Context, data []byte) error {
-	if mq.ch == nil {
-		return errors.New("rabbitmq channel is nil")
+	if mq.pubCh == nil {
+		return errors.New("publish channel is nil")
 	}
 
-	msg := messageData{
-		SenderID: mq.consumerID,
-		Payload:  data,
-	}
-
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-
-	return mq.ch.PublishWithContext(
+	return mq.pubCh.PublishWithContext(
 		ctx,
 		mq.exchange,
 		"",
 		false,
 		false,
 		amqp.Publishing{
-			ContentType:  "application/json",
-			Body:         body,
-			DeliveryMode: amqp.Persistent,
+			ContentType: "application/json",
+			Body:        data,
 		},
 	)
 }
@@ -92,11 +92,11 @@ func (mq *RabbitMQ) Publish(ctx context.Context, data []byte) error {
 func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 	queueName := "consumer_queue_" + mq.consumerID
 
-	q, err := mq.ch.QueueDeclare(
+	q, err := mq.consCh.QueueDeclare(
 		queueName,
-		true,  // durable
-		false, // auto delete
-		false, // exclusive
+		true,
+		false,
+		false,
 		false,
 		nil,
 	)
@@ -104,7 +104,7 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 		return nil, err
 	}
 
-	if err := mq.ch.QueueBind(
+	if err := mq.consCh.QueueBind(
 		q.Name,
 		"",
 		mq.exchange,
@@ -114,10 +114,10 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 		return nil, err
 	}
 
-	msgs, err := mq.ch.Consume(
+	msgs, err := mq.consCh.Consume(
 		q.Name,
-		mq.consumerID, // consumer tag
-		false,         // manual ack
+		mq.consumerID,
+		false,
 		false,
 		false,
 		false,
@@ -131,24 +131,15 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 
 	go func() {
 		defer close(out)
-
 		for {
 			select {
 			case <-ctx.Done():
 				return
-
 			case msg, ok := <-msgs:
 				if !ok {
 					return
 				}
-
-				var data messageData
-				if err := json.Unmarshal(msg.Body, &data); err != nil {
-					_ = msg.Nack(false, false)
-					continue
-				}
-
-				out <- data.Payload
+				out <- msg.Body
 				_ = msg.Ack(false)
 			}
 		}
@@ -161,8 +152,11 @@ func (mq *RabbitMQ) Close() error {
 	var err error
 
 	mq.closeOnce.Do(func() {
-		if mq.ch != nil {
-			_ = mq.ch.Close()
+		if mq.pubCh != nil {
+			_ = mq.pubCh.Close()
+		}
+		if mq.consCh != nil {
+			_ = mq.consCh.Close()
 		}
 		if mq.conn != nil {
 			err = mq.conn.Close()
