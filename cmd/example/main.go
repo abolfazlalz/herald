@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	mathRand "math/rand"
 	"os"
 
 	"github.com/abolfazlalz/herald"
@@ -63,6 +64,14 @@ func main() {
 
 		if text == "exit" {
 			break
+		}
+		if text == "random" {
+			peerID := h.Peers()[mathRand.Intn(len(h.Peers()))]
+			h.SendToPeer(ctx, peerID, map[string]any{
+				"key":     "random",
+				"message": "random message",
+			})
+			continue
 		}
 
 		h.SendMessage(ctx, text)

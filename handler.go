@@ -37,7 +37,7 @@ func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
 		msgCh <- Message{
 			From:    env.SenderID,
-			To:      h.ID(),
+			To:      env.ReceiverID,
 			Type:    MessageTypeMessage,
 			Payload: env.Payload,
 		}

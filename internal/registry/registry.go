@@ -11,6 +11,7 @@ import (
 type Peer struct {
 	LastOnline time.Time
 	PublicKey  []byte
+	RouteKey   string
 }
 
 type PeerRegistry struct {
@@ -60,7 +61,7 @@ func (r *PeerRegistry) UpdateLastOnline(ID string) {
 	r.peers[ID].LastOnline = r.clock.Now()
 }
 
-func (r *PeerRegistry) Add(id string, pubkey []byte) {
+func (r *PeerRegistry) Add(id string, pubkey []byte, routeKey string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.peers[id] = &Peer{

@@ -2,10 +2,8 @@ package herald
 
 import (
 	"context"
-	"errors"
 	"sync"
 
-	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -15,8 +13,9 @@ type RabbitMQ struct {
 	pubCh  *amqp.Channel
 	consCh *amqp.Channel
 
-	exchange   string
-	consumerID string
+	broadcastExchange string
+	directExchange    string
+	queue             string
 
 	closeOnce sync.Once
 }
@@ -28,7 +27,7 @@ type messageData struct {
 
 var _ Transport = (*RabbitMQ)(nil)
 
-func NewRabbitMQ(url, exchange string) (*RabbitMQ, error) {
+func NewRabbitMQ(url string, queue string) (*RabbitMQ, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
 		return nil, err
@@ -47,8 +46,9 @@ func NewRabbitMQ(url, exchange string) (*RabbitMQ, error) {
 		return nil, err
 	}
 
+	// Broadcast exchange
 	if err := pubCh.ExchangeDeclare(
-		exchange,
+		"herald.broadcast",
 		"fanout",
 		true,
 		false,
@@ -56,29 +56,36 @@ func NewRabbitMQ(url, exchange string) (*RabbitMQ, error) {
 		false,
 		nil,
 	); err != nil {
-		consCh.Close()
-		pubCh.Close()
-		conn.Close()
+		return nil, err
+	}
+
+	// Direct exchange (P2P)
+	if err := pubCh.ExchangeDeclare(
+		"herald.direct",
+		"direct",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
 		return nil, err
 	}
 
 	return &RabbitMQ{
-		conn:       conn,
-		pubCh:      pubCh,
-		consCh:     consCh,
-		exchange:   exchange,
-		consumerID: uuid.NewString(),
+		conn:              conn,
+		pubCh:             pubCh,
+		consCh:            consCh,
+		broadcastExchange: "herald.broadcast",
+		directExchange:    "herald.direct",
+		queue:             queue,
 	}, nil
 }
 
-func (mq *RabbitMQ) Publish(ctx context.Context, data []byte) error {
-	if mq.pubCh == nil {
-		return errors.New("publish channel is nil")
-	}
-
+func (mq *RabbitMQ) PublishBroadcast(ctx context.Context, data []byte) error {
 	return mq.pubCh.PublishWithContext(
 		ctx,
-		mq.exchange,
+		mq.broadcastExchange,
 		"",
 		false,
 		false,
@@ -89,8 +96,63 @@ func (mq *RabbitMQ) Publish(ctx context.Context, data []byte) error {
 	)
 }
 
-func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
-	queueName := "consumer_queue_" + mq.consumerID
+func (mq *RabbitMQ) PublishDirect(ctx context.Context, routingKey string, data []byte) error {
+	return mq.pubCh.PublishWithContext(
+		ctx,
+		mq.directExchange,
+		routingKey,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        data,
+		},
+	)
+}
+
+func (mq *RabbitMQ) SubscribeBroadcast(ctx context.Context) (<-chan []byte, error) {
+	q, err := mq.consCh.QueueDeclare(
+		"",
+		false,
+		true,
+		true,
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := mq.consCh.QueueBind(
+		q.Name,
+		"",
+		mq.broadcastExchange,
+		false,
+		nil,
+	); err != nil {
+		return nil, err
+	}
+
+	msgs, err := mq.consCh.Consume(
+		q.Name,
+		"",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan []byte)
+	go forwardMessages(ctx, msgs, out)
+	return out, nil
+}
+
+func (mq *RabbitMQ) SubscribeDirect(ctx context.Context, peerID string) (<-chan []byte, error) {
+	queueName := "peer." + peerID
 
 	q, err := mq.consCh.QueueDeclare(
 		queueName,
@@ -106,8 +168,8 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 
 	if err := mq.consCh.QueueBind(
 		q.Name,
-		"",
-		mq.exchange,
+		peerID,
+		mq.directExchange,
 		false,
 		nil,
 	); err != nil {
@@ -116,8 +178,8 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 
 	msgs, err := mq.consCh.Consume(
 		q.Name,
-		mq.consumerID,
-		false,
+		peerID,
+		true,
 		false,
 		false,
 		false,
@@ -128,29 +190,12 @@ func (mq *RabbitMQ) Subscribe(ctx context.Context) (<-chan []byte, error) {
 	}
 
 	out := make(chan []byte)
-
-	go func() {
-		defer close(out)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg, ok := <-msgs:
-				if !ok {
-					return
-				}
-				out <- msg.Body
-				_ = msg.Ack(false)
-			}
-		}
-	}()
-
+	go forwardMessages(ctx, msgs, out)
 	return out, nil
 }
 
 func (mq *RabbitMQ) Close() error {
 	var err error
-
 	mq.closeOnce.Do(func() {
 		if mq.pubCh != nil {
 			_ = mq.pubCh.Close()
@@ -162,6 +207,24 @@ func (mq *RabbitMQ) Close() error {
 			err = mq.conn.Close()
 		}
 	})
-
 	return err
+}
+
+func forwardMessages(
+	ctx context.Context,
+	msgs <-chan amqp.Delivery,
+	out chan<- []byte,
+) {
+	defer close(out)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-msgs:
+			if !ok {
+				return
+			}
+			out <- msg.Body
+		}
+	}
 }

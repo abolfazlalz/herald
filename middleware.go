@@ -34,3 +34,13 @@ func VerifySignature() Middleware {
 		return nil
 	}
 }
+
+func CheckMessageAccess() Middleware {
+	return func(ctx *MessageContext, h *Herald, env *message.Envelope) error {
+		if env.ReceiverID != "" && env.ReceiverID != h.ID() {
+			ctx.Abort()
+			return nil
+		}
+		return nil
+	}
+}

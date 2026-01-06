@@ -3,7 +3,11 @@ package herald
 import "context"
 
 type Transport interface {
-	Publish(ctx context.Context, data []byte) error
-	Subscribe(ctx context.Context) (<-chan []byte, error)
+	PublishBroadcast(ctx context.Context, data []byte) error
+	PublishDirect(ctx context.Context, routingKey string, data []byte) error
+
+	SubscribeBroadcast(ctx context.Context) (<-chan []byte, error)
+	SubscribeDirect(ctx context.Context, peerID string) (<-chan []byte, error)
+
 	Close() error
 }

@@ -17,22 +17,24 @@ const (
 
 // Envelope structure
 type Envelope struct {
-	Version   int            `json:"version"`
-	Type      EventType      `json:"type"`
-	SenderID  string         `json:"sender_id"`
-	Timestamp int64          `json:"timestamp"`
-	Payload   map[string]any `json:"payload"`
-	Signature []byte         `json:"signature,omitempty"` // ignored in canonicalization
+	Version    int            `json:"version"`
+	Type       EventType      `json:"type"`
+	SenderID   string         `json:"sender_id"`
+	ReceiverID string         `json:"receiver_id,omitempty"`
+	Timestamp  int64          `json:"timestamp"`
+	Payload    map[string]any `json:"payload"`
+	Signature  []byte         `json:"signature,omitempty"`
 }
 
 // NewEnvelope creates a new Envelope
-func NewEnvelope(eventType EventType, senderID string, payload map[string]any) *Envelope {
+func NewEnvelope(eventType EventType, senderID string, receiverID string, payload map[string]any) *Envelope {
 	return &Envelope{
-		Version:   1,
-		Type:      eventType,
-		SenderID:  senderID,
-		Timestamp: time.Now().Unix(),
-		Payload:   payload,
+		Version:    1,
+		Type:       eventType,
+		SenderID:   senderID,
+		ReceiverID: receiverID,
+		Timestamp:  time.Now().Unix(),
+		Payload:    payload,
 	}
 }
 

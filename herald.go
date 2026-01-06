@@ -107,7 +107,7 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			env, err := heartbeat.InitiateHeartbeat(h.id, h.kp, h.signer)
+			env, err := heartbeat.InitiateHeartbeat(h.id, h.kp)
 			if err != nil {
 				log.Printf("heartbeat initiation failed: %v", err)
 				continue
@@ -132,13 +132,21 @@ func (h *Herald) handleMessages(ctx context.Context) {
 	}
 }
 
-func (h *Herald) publish(ctx context.Context, data any) error {
-	jsonB, err := json.Marshal(data)
-	if err != nil {
-		return err
+func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
+	if err := env.Sign(h.signer); err != nil {
+		return fmt.Errorf("envelope sign failed: %v", err)
 	}
 
-	return h.transport.Publish(ctx, jsonB)
+	data, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("error in marshal message: %v", err)
+	}
+
+	if env.ReceiverID != "" {
+		return h.transport.PublishDirect(ctx, env.ReceiverID, data)
+	}
+
+	return h.transport.PublishBroadcast(ctx, data)
 }
 
 func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
@@ -163,6 +171,7 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 	middlewares := []Middleware{
 		VerifySignature(),
 		UpdateLastOnline(),
+		CheckMessageAccess(),
 	}
 
 	msgCtx := NewMessageContext(ctx)
@@ -188,7 +197,9 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 
 func (h *Herald) Start(ctx context.Context) error {
 	defer func() {
-		h.transport.Close()
+		if h.transport != nil {
+			h.transport.Close()
+		}
 	}()
 
 	var err error
@@ -202,11 +213,17 @@ func (h *Herald) Start(ctx context.Context) error {
 		return err
 	}
 
-	dataCh, err := h.transport.Subscribe(ctx)
+	bc, err := h.transport.SubscribeBroadcast(ctx)
 	if err != nil {
 		return err
 	}
-	go h.subscribe(ctx, dataCh)
+	dc, err := h.transport.SubscribeDirect(ctx, h.ID())
+	if err != nil {
+		return err
+	}
+
+	go h.subscribe(ctx, bc)
+	go h.subscribe(ctx, dc)
 
 	if err := h.startHandshake(ctx); err != nil {
 		return err
@@ -225,15 +242,27 @@ func (h *Herald) Start(ctx context.Context) error {
 	return ctx.Err()
 }
 
+func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload map[string]any) error {
+	_, ok := h.registry.PeerByID(peerID)
+	if !ok {
+		return errors.New("unknown peer")
+	}
+
+	env := message.NewEnvelope(
+		message.EventMessage,
+		h.ID(),
+		peerID,
+		payload,
+	)
+
+	return h.publish(ctx, env)
+}
+
 func (h *Herald) Send(ctx context.Context, msg Message) {
 	slog.Debug("Debug: send message")
 
-	env := message.NewEnvelope(message.EventMessage, h.ID(), msg.Payload)
+	env := message.NewEnvelope(message.EventMessage, h.ID(), "", msg.Payload)
 
-	if err := env.Sign(h.signer); err != nil {
-		slog.Error("message sign failed", "error", err)
-		return
-	}
 	if err := h.publish(ctx, env); err != nil {
 		slog.Error("message publish failed", "error", err)
 		return
@@ -309,4 +338,15 @@ func (h *Herald) notify(event MessageType, msg Message) {
 
 func (h *Herald) ID() string {
 	return h.id
+}
+
+func (h *Herald) Peers() []string {
+	peers := h.registry.Peers()
+	peersID := make([]string, len(peers))
+	i := 0
+	for id := range peers {
+		peersID[i] = id
+		i++
+	}
+	return peersID
 }
