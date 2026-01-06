@@ -2,6 +2,7 @@ package herald
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -48,7 +49,7 @@ func NewRabbitMQ(url string, queue string) (*RabbitMQ, error) {
 
 	// Broadcast exchange
 	if err := pubCh.ExchangeDeclare(
-		"herald.broadcast",
+		fmt.Sprintf("herald.%s.broadcast", queue),
 		"fanout",
 		true,
 		false,
@@ -61,7 +62,7 @@ func NewRabbitMQ(url string, queue string) (*RabbitMQ, error) {
 
 	// Direct exchange (P2P)
 	if err := pubCh.ExchangeDeclare(
-		"herald.direct",
+		fmt.Sprintf("herald.%s.direct", queue),
 		"direct",
 		true,
 		false,
@@ -76,8 +77,8 @@ func NewRabbitMQ(url string, queue string) (*RabbitMQ, error) {
 		conn:              conn,
 		pubCh:             pubCh,
 		consCh:            consCh,
-		broadcastExchange: "herald.broadcast",
-		directExchange:    "herald.direct",
+		broadcastExchange: fmt.Sprintf("herald.%s.broadcast", queue),
+		directExchange:    fmt.Sprintf("herald.%s.direct", queue),
 		queue:             queue,
 	}, nil
 }
