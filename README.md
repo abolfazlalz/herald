@@ -43,7 +43,7 @@ type Envelope struct {
     SenderID   string
     ReceiverID string
     Timestamp  int64
-    Payload    map[string]any
+    Payload    []byte
     Signature  []byte
 }
 ```
@@ -79,21 +79,13 @@ This initializes the peer, starts heartbeats, listens for messages, and manages 
 ### Send to a specific peer
 
 ```go
-payload := map[string]any{"message": "Hello!"}
-h.SendToPeer(ctx, "peer-id", payload)
+h.SendToPeer(ctx, "peer-id", []byte("Hello!"))
 ```
 
 ### Broadcast message
 
 ```go
-payload := map[string]any{"message": "Hello everyone!"}
-h.SendPayload(ctx, payload)
-```
-
-### Send simple text
-
-```go
-h.SendMessage(ctx, "Hello World")
+h.Broadcast(ctx, []byte("Hello everyone!"))
 ```
 
 ### Send and wait for ACK
@@ -179,14 +171,13 @@ Manages the list of known peers and their last online timestamp.
 ```go
 ctx := context.Background()
 transport, _ := transport.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "myQueue")
-privateKey, _ := base64.StdEncoding.DecodeString("...")
-h := herald.New(transport, privateKey)
+h, _ := herald.New(transport)
 
 h.OnPeerJoin(func(ctx context.Context, id string){ fmt.Println("Peer joined:", id) })
 
 go h.Start(ctx)
 
-h.SendMessage(ctx, "Hello world!")
+h.Broadcast(ctx, []byte("Hello world!"))
 ```
 
 # License

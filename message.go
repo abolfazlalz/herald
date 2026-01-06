@@ -24,5 +24,5 @@ type Message struct {
 	From    string
 	To      string
 	Type    MessageType
-	Payload map[string]any
+	Payload []byte
 }

@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/abolfazlalz/herald/internal/acknowledge"
 	"github.com/abolfazlalz/herald/internal/handshake"
 	"github.com/abolfazlalz/herald/internal/heartbeat"
 	"github.com/abolfazlalz/herald/internal/message"
+	"github.com/abolfazlalz/herald/internal/offline"
 	"github.com/abolfazlalz/herald/internal/registry"
 	"github.com/abolfazlalz/herald/internal/security"
 	"github.com/abolfazlalz/herald/transport"
@@ -20,18 +21,20 @@ import (
 )
 
 const (
-	// PeerTimeout
+	// PeerTimeout defines the duration after which a peer is considered offline.
 	PeerTimeout = 5 * time.Second
 )
 
+// pendingAck represents a pending acknowledgement for a sent message.
 type pendingAck struct {
 	ch chan struct{}
 }
 
+// Herald represents the main P2P engine that handles messaging, heartbeat,
+// peer registry, and hooks for join/leave events.
 type Herald struct {
-	transport  transport.Transport
-	id         string
-	privateKey []byte
+	transport transport.Transport
+	id        string
 
 	kp       *security.KeyPair
 	signer   security.Signer
@@ -40,7 +43,7 @@ type Herald struct {
 
 	subs            map[MessageType][]chan Message
 	receiveMsgCh    chan Message
-	sendMessageChan chan Message
+	sendMessageChan chan *message.Envelope
 	mu              sync.RWMutex
 
 	pending map[string]*pendingAck
@@ -50,17 +53,31 @@ type Herald struct {
 	hooks Hook
 }
 
-func New(transport transport.Transport, privateKey []byte) *Herald {
+// New creates a new Herald instance, generating a key pair and setting up default handlers.
+func New(transport transport.Transport) (*Herald, error) {
 	id := uuid.New().String()
+
+	kp, err := security.Generate()
+	if err != nil {
+		return nil, err
+	}
+
+	verifier := security.NewVerifier()
+	signer, err := security.NewSigner(kp)
+	if err != nil {
+		return nil, err
+	}
 
 	h := &Herald{
 		transport:       transport,
 		id:              id,
-		privateKey:      privateKey,
+		kp:              kp,
+		verifier:        verifier,
+		signer:          signer,
 		registry:        registry.NewPeerRegistry(),
 		receiveMsgCh:    make(chan Message),
 		subs:            make(map[MessageType][]chan Message),
-		sendMessageChan: make(chan Message),
+		sendMessageChan: make(chan *message.Envelope),
 		pending:         make(map[string]*pendingAck),
 	}
 	h.handlers = map[message.EventType]handlerFunc{
@@ -70,18 +87,19 @@ func New(transport transport.Transport, privateKey []byte) *Herald {
 		message.EventAck:       handleAck(),
 		message.EventOffline:   handleOffline(),
 	}
-	return h
+	return h, nil
 }
 
+// startHandshake initiates the handshake with peers.
 func (h *Herald) startHandshake(ctx context.Context) error {
 	msg, err := handshake.InitiateHandshake(h.id, h.kp, h.signer)
 	if err != nil {
 		return err
 	}
-
 	return h.publish(ctx, msg)
 }
 
+// startCheckHeartbeats monitors all peers and removes those who have timed out.
 func (h *Herald) startCheckHeartbeats(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -89,10 +107,8 @@ func (h *Herald) startCheckHeartbeats(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			// shutdown graceful
 			log.Println("healthcheck stopped:", ctx.Err())
 			return
-
 		case <-ticker.C:
 			for id, peer := range h.registry.Peers() {
 				if time.Since(peer.LastOnline) > PeerTimeout {
@@ -104,6 +120,7 @@ func (h *Herald) startCheckHeartbeats(ctx context.Context) {
 	}
 }
 
+// startHeartbeatPublisher periodically sends heartbeat messages to peers.
 func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -113,14 +130,12 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 		case <-ctx.Done():
 			log.Println("heartbeat publisher stopped:", ctx.Err())
 			return
-
 		case <-ticker.C:
 			env, err := heartbeat.InitiateHeartbeat(h.id, h.kp)
 			if err != nil {
 				log.Printf("heartbeat initiation failed: %v", err)
 				continue
 			}
-
 			if err := h.publish(ctx, env); err != nil {
 				log.Printf("publish heartbeat failed: %v", err)
 			}
@@ -128,22 +143,7 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 	}
 }
 
-func (h *Herald) sendMessage(ctx context.Context, msg Message) (*message.Envelope, error) {
-	env := message.NewEnvelope(
-		msg.Type.GetType(),
-		h.ID(),
-		msg.To,
-		msg.Payload,
-	)
-
-	ackCh := make(chan struct{})
-	h.mu.Lock()
-	h.pending[env.ID] = &pendingAck{ch: ackCh}
-	h.mu.Unlock()
-
-	return env, h.publish(ctx, env)
-}
-
+// handleReceiveMessages reads messages from the receive channel and notifies subscribers.
 func (h *Herald) handleReceiveMessages(ctx context.Context) {
 	for {
 		select {
@@ -156,17 +156,20 @@ func (h *Herald) handleReceiveMessages(ctx context.Context) {
 	}
 }
 
+// handleSendMessages continuously publishes messages from the sendMessageChan.
 func (h *Herald) handleSendMessages(ctx context.Context) {
 	for {
 		select {
 		case msg := <-h.sendMessageChan:
-			h.sendMessage(ctx, msg)
+			h.publish(ctx, msg)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
+// publish signs, marshals, and sends a message envelope either directly or as broadcast.
+// It also registers the message in the pending ack map.
 func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 	if err := env.Sign(h.signer); err != nil {
 		return fmt.Errorf("envelope sign failed: %v", err)
@@ -193,6 +196,7 @@ func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 	return nil
 }
 
+// subscribe listens to incoming raw messages and executes them.
 func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 	for data := range dataCh {
 		if err := h.executeMessage(ctx, data); err != nil {
@@ -202,23 +206,21 @@ func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 	return nil
 }
 
+// handleAck sends an acknowledgement for a received message.
 func (h *Herald) handleAck(_ context.Context, env message.Envelope) error {
 	if env.Type != message.EventMessage {
 		return nil
 	}
 
-	h.sendMessageChan <- Message{
-		From: h.ID(),
-		To:   env.SenderID,
-		Type: MessageTypeACK,
-		Payload: map[string]any{
-			"ack_for": env.ID,
-			"status":  "ok",
-		},
+	ackEnv, err := acknowledge.InitiateAcknowledge(h.ID(), env.SenderID, env.ID, "OK")
+	if err != nil {
+		return err
 	}
+	h.sendMessageChan <- ackEnv
 	return nil
 }
 
+// executeMessage runs middleware and handler functions for an incoming message.
 func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 	var env message.Envelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -258,6 +260,7 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 	return nil
 }
 
+// notify sends a message to all subscribers of a specific event type.
 func (h *Herald) notify(event MessageType, msg Message) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -266,40 +269,32 @@ func (h *Herald) notify(event MessageType, msg Message) {
 		select {
 		case sub <- msg:
 		default:
-			// drop or log
 		}
 	}
 }
 
+// callPeerJoinHook triggers all registered OnPeerJoin hooks.
 func (h *Herald) callPeerJoinHook(ctx context.Context, peerID string) {
 	for _, hook := range h.hooks.OnPeerJoin {
 		hook(ctx, peerID)
 	}
 }
 
+// callPeerLeaveHook triggers all registered OnPeerLeave hooks.
 func (h *Herald) callPeerLeaveHook(ctx context.Context, peerID string) {
 	for _, hook := range h.hooks.OnPeerLeave {
 		hook(ctx, peerID)
 	}
 }
 
+// Start runs the Herald engine, subscribes to messages, performs handshake,
+// starts heartbeat, and manages message sending/receiving.
 func (h *Herald) Start(ctx context.Context) error {
 	defer func() {
 		if h.transport != nil {
 			h.transport.Close()
 		}
 	}()
-
-	var err error
-	h.kp, err = security.LoadFromBytes(h.privateKey)
-	if err != nil {
-		return err
-	}
-	h.verifier = security.NewVerifier()
-	h.signer, err = security.NewSigner(h.kp)
-	if err != nil {
-		return err
-	}
 
 	bc, err := h.transport.SubscribeBroadcast(ctx)
 	if err != nil {
@@ -317,13 +312,9 @@ func (h *Herald) Start(ctx context.Context) error {
 		return err
 	}
 
-	// start heartbeat publisher
 	go h.startHeartbeatPublisher(ctx)
-	// check healthcheck
 	go h.startCheckHeartbeats(ctx)
-	// start message handler
 	go h.handleReceiveMessages(ctx)
-	// handle start send message
 	go h.handleSendMessages(ctx)
 
 	<-ctx.Done()
@@ -331,69 +322,46 @@ func (h *Herald) Start(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload map[string]any) error {
+// SendToPeer sends a message to a specific peer.
+func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload []byte) error {
 	_, ok := h.registry.PeerByID(peerID)
 	if !ok {
 		return ErrUnknownPeer
 	}
 
-	msg := Message{
-		ID:      uuid.NewString(),
-		From:    h.ID(),
-		To:      peerID,
-		Type:    MessageTypeMessage,
-		Payload: payload,
-	}
-	h.Send(ctx, msg)
+	msg := message.NewEnvelope(message.EventMessage, h.ID(), peerID, payload)
+	h.send(msg)
 	return nil
 }
 
-func (h *Herald) Send(ctx context.Context, msg Message) {
+// send pushes a message envelope into the sendMessageChan.
+func (h *Herald) send(msg *message.Envelope) {
 	h.sendMessageChan <- msg
 }
 
-func (h *Herald) SendPayload(ctx context.Context, payload map[string]any) {
-	slog.Debug("Debug: send message")
-
-	h.sendMessageChan <- Message{
-		Type:    MessageTypeMessage,
-		Payload: payload,
-		From:    h.ID(),
-		To:      "",
-	}
+// Broadcast sends a message to all peers.
+func (h *Herald) Broadcast(ctx context.Context, payload []byte) {
+	h.sendMessageChan <- message.NewEnvelope(message.EventMessage, h.ID(), "", payload)
 }
 
-func (h *Herald) SendMessage(ctx context.Context, msg string) {
-	payload := map[string]any{
-		"type":    MessageTypeMessage,
-		"service": h.ID(),
-		"message": msg,
-	}
-	h.SendPayload(ctx, payload)
-}
+// SendAndWait sends a message to a peer and waits for an acknowledgement or timeout.
+func (h *Herald) SendAndWait(ctx context.Context, peerID string, payload []byte, timeout time.Duration) error {
+	msg := message.NewEnvelope(message.EventMessage, h.ID(), peerID, payload)
 
-func (h *Herald) SendAndWait(ctx context.Context, peerID string, payload map[string]any, timeout time.Duration) error {
-	msg := Message{
-		From:    h.ID(),
-		To:      peerID,
-		Type:    MessageTypeMessage,
-		Payload: payload,
-	}
-	env, err := h.sendMessage(ctx, msg)
-	if err != nil {
-		return err
-	}
+	h.publish(ctx, msg)
 
 	select {
-	case <-h.pending[env.ID].ch:
+	case <-h.pending[msg.ID].ch:
 		return nil
 	case <-time.After(timeout):
 		return errors.New("ack timeout")
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
+// Subscribe subscribes to a specific message type with a buffered channel.
 func (h *Herald) Subscribe(ctx context.Context, event MessageType, buffer int) Subscription {
-
 	ch := make(chan Message, buffer)
 
 	h.mu.Lock()
@@ -406,17 +374,17 @@ func (h *Herald) Subscribe(ctx context.Context, event MessageType, buffer int) S
 	}()
 
 	return Subscription{
-		C: ch,
-		cancel: func() {
-			close(ch)
-		},
+		C:      ch,
+		cancel: func() { close(ch) },
 	}
 }
 
+// ID returns the unique identifier of this Herald instance.
 func (h *Herald) ID() string {
 	return h.id
 }
 
+// Peers returns a list of peer IDs currently in the registry.
 func (h *Herald) Peers() []string {
 	peers := h.registry.Peers()
 	peersID := make([]string, len(peers))
@@ -428,23 +396,23 @@ func (h *Herald) Peers() []string {
 	return peersID
 }
 
+// OnPeerJoin registers a hook for when a peer joins.
 func (h *Herald) OnPeerJoin(hook PeerHook) {
 	h.hooks.OnPeerJoin = append(h.hooks.OnPeerJoin, hook)
 }
 
+// OnPeerLeave registers a hook for when a peer leaves.
 func (h *Herald) OnPeerLeave(hook PeerHook) {
 	h.hooks.OnPeerLeave = append(h.hooks.OnPeerLeave, hook)
 }
 
+// Close sends an offline message and shuts down the Herald instance.
 func (h *Herald) Close(ctx context.Context) error {
-	h.sendMessage(ctx, Message{
-		Type: MessageTypeOffline,
-		Payload: map[string]any{
-			"service": h.ID(),
-			"message": "bye",
-		},
-		From: h.ID(),
-	})
+	msg, err := offline.InitOffline(h.ID(), "close")
+	if err != nil {
+		return err
+	}
+	h.publish(ctx, msg)
 
 	select {
 	case <-time.After(500 * time.Millisecond):

@@ -3,7 +3,6 @@ package security
 import (
 	"crypto/ed25519"
 	"errors"
-	"fmt"
 )
 
 // Verifier interface
@@ -27,7 +26,6 @@ func (v *Ed25519Verifier) Verify(data []byte, signature []byte, pubKey ed25519.P
 		return errors.New("invalid signature size")
 	}
 	if pubKey == nil || len(pubKey) != ed25519.PublicKeySize {
-		fmt.Println("pubkey:", string(pubKey))
 		return errors.New("invalid public key size")
 	}
 
