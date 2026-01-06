@@ -23,6 +23,8 @@ func handleAnnounce() handlerFunc {
 			return err
 		}
 
+		h.callPeerJoinHook(ctx, env.SenderID)
+
 		return h.startHandshake(ctx)
 	}
 }
@@ -56,6 +58,13 @@ func handleAck() handlerFunc {
 			delete(h.pending, id)
 		}
 		h.mu.Unlock()
+		return nil
+	}
+}
+
+func handleOffline() handlerFunc {
+	return func(ctx context.Context, h *Herald, e *message.Envelope) error {
+		h.registry.Remove(e.SenderID)
 		return nil
 	}
 }

@@ -8,6 +8,7 @@ const (
 	MessageTypeAnnounce MessageType = "announce"
 	MessageTypeMessage  MessageType = "message"
 	MessageTypeACK      MessageType = "ack"
+	MessageTypeOffline  MessageType = "offline"
 )
 
 func (mt MessageType) GetType() message.EventType {

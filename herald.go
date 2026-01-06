@@ -15,6 +15,7 @@ import (
 	"github.com/abolfazlalz/herald/internal/message"
 	"github.com/abolfazlalz/herald/internal/registry"
 	"github.com/abolfazlalz/herald/internal/security"
+	"github.com/abolfazlalz/herald/transport"
 	"github.com/google/uuid"
 )
 
@@ -28,7 +29,7 @@ type pendingAck struct {
 }
 
 type Herald struct {
-	transport  Transport
+	transport  transport.Transport
 	id         string
 	privateKey []byte
 
@@ -45,9 +46,11 @@ type Herald struct {
 	pending map[string]*pendingAck
 
 	handlers map[message.EventType]handlerFunc
+
+	hooks Hook
 }
 
-func New(transport Transport, privateKey []byte) *Herald {
+func New(transport transport.Transport, privateKey []byte) *Herald {
 	id := uuid.New().String()
 
 	h := &Herald{
@@ -65,6 +68,7 @@ func New(transport Transport, privateKey []byte) *Herald {
 		message.EventHeartbeat: handleHeartbeat(),
 		message.EventMessage:   handleMessage(h.receiveMsgCh),
 		message.EventAck:       handleAck(),
+		message.EventOffline:   handleOffline(),
 	}
 	return h
 }
@@ -92,8 +96,8 @@ func (h *Herald) startCheckHeartbeats(ctx context.Context) {
 		case <-ticker.C:
 			for id, peer := range h.registry.Peers() {
 				if time.Since(peer.LastOnline) > PeerTimeout {
-					fmt.Printf("peer %s is dead\n", id)
 					h.registry.Remove(id)
+					h.callPeerLeaveHook(ctx, id)
 				}
 			}
 		}
@@ -267,6 +271,18 @@ func (h *Herald) notify(event MessageType, msg Message) {
 	}
 }
 
+func (h *Herald) callPeerJoinHook(ctx context.Context, peerID string) {
+	for _, hook := range h.hooks.OnPeerJoin {
+		hook(ctx, peerID)
+	}
+}
+
+func (h *Herald) callPeerLeaveHook(ctx context.Context, peerID string) {
+	for _, hook := range h.hooks.OnPeerLeave {
+		hook(ctx, peerID)
+	}
+}
+
 func (h *Herald) Start(ctx context.Context) error {
 	defer func() {
 		if h.transport != nil {
@@ -311,6 +327,7 @@ func (h *Herald) Start(ctx context.Context) error {
 	go h.handleSendMessages(ctx)
 
 	<-ctx.Done()
+	h.Close(ctx)
 	return ctx.Err()
 }
 
@@ -409,4 +426,37 @@ func (h *Herald) Peers() []string {
 		i++
 	}
 	return peersID
+}
+
+func (h *Herald) OnPeerJoin(hook PeerHook) {
+	h.hooks.OnPeerJoin = append(h.hooks.OnPeerJoin, hook)
+}
+
+func (h *Herald) OnPeerLeave(hook PeerHook) {
+	h.hooks.OnPeerLeave = append(h.hooks.OnPeerLeave, hook)
+}
+
+func (h *Herald) Close(ctx context.Context) error {
+	h.sendMessage(ctx, Message{
+		Type: MessageTypeOffline,
+		Payload: map[string]any{
+			"service": h.ID(),
+			"message": "👋 going offline",
+		},
+		From: h.ID(),
+	})
+
+	select {
+	case <-time.After(500 * time.Millisecond):
+	case <-ctx.Done():
+	}
+
+	if h.transport != nil {
+		h.transport.Close()
+	}
+
+	close(h.sendMessageChan)
+	close(h.receiveMsgCh)
+
+	return nil
 }
