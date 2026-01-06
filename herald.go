@@ -441,7 +441,7 @@ func (h *Herald) Close(ctx context.Context) error {
 		Type: MessageTypeOffline,
 		Payload: map[string]any{
 			"service": h.ID(),
-			"message": "👋 going offline",
+			"message": "bye",
 		},
 		From: h.ID(),
 	})

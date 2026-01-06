@@ -1,79 +1,194 @@
-# Herald
+# Herald Library Documentation
 
-**Herald** is a lightweight, secure peer-to-peer (P2P) messaging library for Go. It allows services or clients to form a network of peers that can exchange messages securely, verify identities via digital signatures, and track each other's online status.
+# Overview
 
----
+**Herald** is a Go-based peer-to-peer messaging library designed to facilitate secure, reliable, and decentralized communication between peers. It supports direct peer-to-peer messaging, broadcast messaging, heartbeats for online status, and peer lifecycle hooks.
 
-## Features
+The library uses **Ed25519 cryptography** for signing and verifying messages, and supports pluggable transport layers (such as RabbitMQ).
 
-* **Secure Messaging**: All messages are signed using Ed25519 keys and can be verified for authenticity.
-* **Peer Registry**: Track online/offline status of peers and monitor network health.
-* **Automatic Handshake**: Discover and register new peers via public key exchange.
-* **Heartbeat System**: Periodically monitor peer availability through heartbeat messages.
-* **Flexible Middleware**: Add custom logic such as logging, message filtering, or additional validations.
-* **Pluggable Transport**: Initial implementation uses RabbitMQ, with support for other transport layers.
-* **Canonical JSON**: Ensures consistent message encoding for signing and verification.
-
----
-
-## Getting Started
-
-### Installation
+# Installation
 
 ```bash
 go get github.com/abolfazlalz/herald
 ```
 
-### Basic Usage
+# Core Concepts
+
+## Peer
+
+A peer is any instance of Herald running in the network. Peers have:
+
+- A unique ID (`string`)
+- Public key
+- Optional routing key (for transport)
+
+## Message Types
+
+Herald defines several types of messages:
+
+- `MessageTypeAnnounce`: Announces a new peer.
+- `MessageTypeMessage`: Standard message between peers.
+- `MessageTypeACK`: Acknowledgment message.
+- `MessageTypeOffline`: Indicates that a peer has gone offline. Other peers should update their registry/state accordingly.
+
+## Envelope
+
+All messages are wrapped in an `Envelope`:
 
 ```go
-package main
-
-import (
-    "context"
-    "log"
-
-    "github.com/abolfazlalz/herald"
-    "github.com/abolfazlalz/herald/internal/security"
-)
-
-func main() {
-    transport, err := herald.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "events")
-    if err != nil {
-        log.Fatalf("failed to create transport: %v", err)
-    }
-    defer transport.Close()
-
-    kp, err := security.Generate()
-    if err != nil {
-        log.Fatalf("failed to generate keys: %v", err)
-    }
-
-    h := herald.New(transport, kp.Private)
-
-    ctx := context.Background()
-    if err := h.Start(ctx); err != nil {
-        log.Fatalf("failed to start herald: %v", err)
-    }
+type Envelope struct {
+    ID         string
+    Version    int
+    Type       EventType
+    SenderID   string
+    ReceiverID string
+    Timestamp  int64
+    Payload    map[string]any
+    Signature  []byte
 }
 ```
 
----
+Envelopes are signed and verified using Ed25519 for authenticity.
 
-## Use Cases
+# API
 
-* Distributed systems requiring secure P2P notifications
-* Microservices exchanging verified messages
-* IoT networks for device status and real-time control
+## Creating a Herald Instance
 
----
+```go
+import "github.com/abolfazlalz/herald/transport"
 
-## Contributing
+transport, _ := transport.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "myQueue")
+privateKey := []byte{/* your 64-byte Ed25519 private key */}
+h := herald.New(transport, privateKey)
+```
 
-Contributions are welcome! Please follow Go best practices and maintain clean, modular code. Open an issue or a pull request for any bug fixes or enhancements.
+## Starting the Library
 
----
+```go
+ctx := context.Background()
+err := h.Start(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+```
 
-## License
+This initializes the peer, starts heartbeats, listens for messages, and manages the peer lifecycle.
 
-MIT License © 2025 Abolfazl Alizadeh
+## Sending Messages
+
+### Send to a specific peer
+
+```go
+payload := map[string]any{"message": "Hello!"}
+h.SendToPeer(ctx, "peer-id", payload)
+```
+
+### Broadcast message
+
+```go
+payload := map[string]any{"message": "Hello everyone!"}
+h.SendPayload(ctx, payload)
+```
+
+### Send simple text
+
+```go
+h.SendMessage(ctx, "Hello World")
+```
+
+### Send and wait for ACK
+
+```go
+err := h.SendAndWait(ctx, "peer-id", payload, 5*time.Second)
+if err != nil {
+    log.Println("Failed to receive ack:", err)
+}
+```
+
+## Subscribing to Messages
+
+```go
+sub := h.Subscribe(ctx, herald.MessageTypeMessage, 10)
+for msg := range sub.C {
+    fmt.Println("Received message:", msg.Payload)
+}
+```
+
+## Hooks for Peer Lifecycle
+
+```go
+h.OnPeerJoin(func(ctx context.Context, peerID string) {
+    fmt.Println(peerID, "joined")
+})
+
+h.OnPeerLeave(func(ctx context.Context, peerID string) {
+    fmt.Println(peerID, "left")
+})
+```
+
+## Closing a Peer
+
+```go
+h.Close(ctx)
+```
+
+This sends an offline message to peers and closes all channels.
+
+# Middleware
+
+Herald supports middleware for processing incoming messages:
+
+- `VerifySignature()`: Checks signature of message.
+- `UpdateLastOnline()`: Updates peer's last online timestamp.
+- `CheckMessageAccess()`: Aborts processing if the message is not addressed to this peer.
+
+# Transport Interface
+
+Herald uses a pluggable `Transport` interface:
+
+```go
+type Transport interface {
+    PublishBroadcast(ctx context.Context, data []byte) error
+    PublishDirect(ctx context.Context, routingKey string, data []byte) error
+    SubscribeBroadcast(ctx context.Context) (<-chan []byte, error)
+    SubscribeDirect(ctx context.Context, peerID string) (<-chan []byte, error)
+    Close() error
+}
+```
+
+RabbitMQ is provided as a reference implementation (`transport/rabbitmq.go`).
+
+# Security
+
+Herald uses **Ed25519**:
+
+- `KeyPair`: represents public/private keys.
+- `Signer`: signs messages.
+- `Verifier`: verifies messages.
+
+# Heartbeat
+
+Herald periodically sends heartbeat messages to indicate online status.
+
+# Peer Registry
+
+Manages the list of known peers and their last online timestamp.
+
+# Example
+
+```go
+ctx := context.Background()
+transport, _ := transport.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "myQueue")
+privateKey, _ := base64.StdEncoding.DecodeString("...")
+h := herald.New(transport, privateKey)
+
+h.OnPeerJoin(func(ctx context.Context, id string){ fmt.Println("Peer joined:", id) })
+
+go h.Start(ctx)
+
+h.SendMessage(ctx, "Hello world!")
+```
+
+# License
+
+MIT License
