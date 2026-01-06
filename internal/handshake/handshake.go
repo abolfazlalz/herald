@@ -43,6 +43,5 @@ func RespondHandshake(env *message.Envelope, verifier security.Verifier, registr
 	}
 
 	registry.Add(env.SenderID, pubKey, routeKey)
-	fmt.Printf("✅ Handshake completed with peer %s\n", env.SenderID)
 	return nil
 }

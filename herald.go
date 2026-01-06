@@ -23,8 +23,8 @@ const (
 	PeerTimeout = 5 * time.Second
 )
 
-type subscriber struct {
-	ch chan Message
+type pendingAck struct {
+	ch chan struct{}
 }
 
 type Herald struct {
@@ -38,9 +38,11 @@ type Herald struct {
 	registry *registry.PeerRegistry
 
 	subs            map[MessageType][]chan Message
-	msgCh           chan Message
+	receiveMsgCh    chan Message
 	sendMessageChan chan Message
 	mu              sync.RWMutex
+
+	pending map[string]*pendingAck
 
 	handlers map[message.EventType]handlerFunc
 }
@@ -53,14 +55,16 @@ func New(transport Transport, privateKey []byte) *Herald {
 		id:              id,
 		privateKey:      privateKey,
 		registry:        registry.NewPeerRegistry(),
-		msgCh:           make(chan Message),
+		receiveMsgCh:    make(chan Message),
 		subs:            make(map[MessageType][]chan Message),
 		sendMessageChan: make(chan Message),
+		pending:         make(map[string]*pendingAck),
 	}
 	h.handlers = map[message.EventType]handlerFunc{
 		message.EventAnnounce:  handleAnnounce(),
 		message.EventHeartbeat: handleHeartbeat(),
-		message.EventMessage:   handleMessage(h.msgCh),
+		message.EventMessage:   handleMessage(h.receiveMsgCh),
+		message.EventAck:       handleAck(),
 	}
 	return h
 }
@@ -120,13 +124,40 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 	}
 }
 
-func (h *Herald) handleMessages(ctx context.Context) {
+func (h *Herald) sendMessage(ctx context.Context, msg Message) (*message.Envelope, error) {
+	env := message.NewEnvelope(
+		msg.Type.GetType(),
+		h.ID(),
+		msg.To,
+		msg.Payload,
+	)
+
+	ackCh := make(chan struct{})
+	h.mu.Lock()
+	h.pending[env.ID] = &pendingAck{ch: ackCh}
+	h.mu.Unlock()
+
+	return env, h.publish(ctx, env)
+}
+
+func (h *Herald) handleReceiveMessages(ctx context.Context) {
 	for {
 		select {
-		case msg := <-h.msgCh:
+		case msg := <-h.receiveMsgCh:
 			h.notify(msg.Type, msg)
 		case <-ctx.Done():
 			log.Println("message handler stopped:", ctx.Err())
+			return
+		}
+	}
+}
+
+func (h *Herald) handleSendMessages(ctx context.Context) {
+	for {
+		select {
+		case msg := <-h.sendMessageChan:
+			h.sendMessage(ctx, msg)
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -143,10 +174,19 @@ func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 	}
 
 	if env.ReceiverID != "" {
-		return h.transport.PublishDirect(ctx, env.ReceiverID, data)
+		err = h.transport.PublishDirect(ctx, env.ReceiverID, data)
+	} else {
+		err = h.transport.PublishBroadcast(ctx, data)
+	}
+	if err != nil {
+		return err
 	}
 
-	return h.transport.PublishBroadcast(ctx, data)
+	ack := make(chan struct{})
+	h.mu.Lock()
+	h.pending[env.ID] = &pendingAck{ch: ack}
+	h.mu.Unlock()
+	return nil
 }
 
 func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
@@ -154,6 +194,23 @@ func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 		if err := h.executeMessage(ctx, data); err != nil {
 			log.Printf("error during execute message: %v", err)
 		}
+	}
+	return nil
+}
+
+func (h *Herald) handleAck(_ context.Context, env message.Envelope) error {
+	if env.Type != message.EventMessage {
+		return nil
+	}
+
+	h.sendMessageChan <- Message{
+		From: h.ID(),
+		To:   env.SenderID,
+		Type: MessageTypeACK,
+		Payload: map[string]any{
+			"ack_for": env.ID,
+			"status":  "ok",
+		},
 	}
 	return nil
 }
@@ -192,7 +249,22 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 	if err := handler(msgCtx, h, &env); err != nil {
 		return fmt.Errorf("error during handle envelope action: %v", err)
 	}
+
+	h.handleAck(ctx, env)
 	return nil
+}
+
+func (h *Herald) notify(event MessageType, msg Message) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	for _, sub := range h.subs[event] {
+		select {
+		case sub <- msg:
+		default:
+			// drop or log
+		}
+	}
 }
 
 func (h *Herald) Start(ctx context.Context) error {
@@ -234,7 +306,7 @@ func (h *Herald) Start(ctx context.Context) error {
 	// check healthcheck
 	go h.startCheckHeartbeats(ctx)
 	// start message handler
-	go h.handleMessages(ctx)
+	go h.handleReceiveMessages(ctx)
 	// handle start send message
 	go h.handleSendMessages(ctx)
 
@@ -245,39 +317,22 @@ func (h *Herald) Start(ctx context.Context) error {
 func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload map[string]any) error {
 	_, ok := h.registry.PeerByID(peerID)
 	if !ok {
-		return errors.New("unknown peer")
+		return ErrUnknownPeer
 	}
 
-	env := message.NewEnvelope(
-		message.EventMessage,
-		h.ID(),
-		peerID,
-		payload,
-	)
-
-	return h.publish(ctx, env)
+	msg := Message{
+		ID:      uuid.NewString(),
+		From:    h.ID(),
+		To:      peerID,
+		Type:    MessageTypeMessage,
+		Payload: payload,
+	}
+	h.Send(ctx, msg)
+	return nil
 }
 
 func (h *Herald) Send(ctx context.Context, msg Message) {
-	slog.Debug("Debug: send message")
-
-	env := message.NewEnvelope(message.EventMessage, h.ID(), "", msg.Payload)
-
-	if err := h.publish(ctx, env); err != nil {
-		slog.Error("message publish failed", "error", err)
-		return
-	}
-}
-
-func (h *Herald) handleSendMessages(ctx context.Context) {
-	for {
-		select {
-		case msg := <-h.sendMessageChan:
-			h.Send(ctx, msg)
-		case <-ctx.Done():
-			return
-		}
-	}
+	h.sendMessageChan <- msg
 }
 
 func (h *Herald) SendPayload(ctx context.Context, payload map[string]any) {
@@ -286,6 +341,8 @@ func (h *Herald) SendPayload(ctx context.Context, payload map[string]any) {
 	h.sendMessageChan <- Message{
 		Type:    MessageTypeMessage,
 		Payload: payload,
+		From:    h.ID(),
+		To:      "",
 	}
 }
 
@@ -298,11 +355,27 @@ func (h *Herald) SendMessage(ctx context.Context, msg string) {
 	h.SendPayload(ctx, payload)
 }
 
-func (h *Herald) Subscribe(
-	ctx context.Context,
-	event MessageType,
-	buffer int,
-) Subscription {
+func (h *Herald) SendAndWait(ctx context.Context, peerID string, payload map[string]any, timeout time.Duration) error {
+	msg := Message{
+		From:    h.ID(),
+		To:      peerID,
+		Type:    MessageTypeMessage,
+		Payload: payload,
+	}
+	env, err := h.sendMessage(ctx, msg)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-h.pending[env.ID].ch:
+		return nil
+	case <-time.After(timeout):
+		return errors.New("ack timeout")
+	}
+}
+
+func (h *Herald) Subscribe(ctx context.Context, event MessageType, buffer int) Subscription {
 
 	ch := make(chan Message, buffer)
 
@@ -320,19 +393,6 @@ func (h *Herald) Subscribe(
 		cancel: func() {
 			close(ch)
 		},
-	}
-}
-
-func (h *Herald) notify(event MessageType, msg Message) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	for _, sub := range h.subs[event] {
-		select {
-		case sub <- msg:
-		default:
-			// drop or log
-		}
 	}
 }
 

@@ -36,11 +36,26 @@ func handleHeartbeat() handlerFunc {
 func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
 		msgCh <- Message{
+			ID:      env.ID,
 			From:    env.SenderID,
 			To:      env.ReceiverID,
 			Type:    MessageTypeMessage,
 			Payload: env.Payload,
 		}
+		return nil
+	}
+}
+
+func handleAck() handlerFunc {
+	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
+		id, _ := env.Payload["ack_for"].(string)
+
+		h.mu.Lock()
+		if p, ok := h.pending[id]; ok {
+			close(p.ch)
+			delete(h.pending, id)
+		}
+		h.mu.Unlock()
 		return nil
 	}
 }

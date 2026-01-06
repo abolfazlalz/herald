@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/abolfazlalz/herald/internal/security"
+	"github.com/google/uuid"
 )
 
 type EventType string
@@ -13,10 +14,12 @@ const (
 	EventHeartbeat EventType = "heartbeat"
 	EventMessage   EventType = "message"
 	EventOffline   EventType = "offline"
+	EventAck       EventType = "ack"
 )
 
 // Envelope structure
 type Envelope struct {
+	ID         string         `json:"id"`
 	Version    int            `json:"version"`
 	Type       EventType      `json:"type"`
 	SenderID   string         `json:"sender_id"`
@@ -29,6 +32,7 @@ type Envelope struct {
 // NewEnvelope creates a new Envelope
 func NewEnvelope(eventType EventType, senderID string, receiverID string, payload map[string]any) *Envelope {
 	return &Envelope{
+		ID:         uuid.New().String(),
 		Version:    1,
 		Type:       eventType,
 		SenderID:   senderID,

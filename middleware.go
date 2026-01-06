@@ -2,7 +2,6 @@ package herald
 
 import (
 	"fmt"
-	"log/slog"
 
 	"github.com/abolfazlalz/herald/internal/message"
 )
@@ -23,9 +22,7 @@ func VerifySignature() Middleware {
 		}
 		peer, ok := h.registry.PeerByID(env.SenderID)
 		if !ok {
-			ctx.Abort()
-			slog.Warn("unknown peer", "peer", env.SenderID)
-			return nil
+			return ErrUnknownPeer
 		}
 
 		if err := env.Verify(h.verifier, peer.PublicKey); err != nil {
