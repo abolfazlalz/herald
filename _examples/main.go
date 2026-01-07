@@ -9,7 +9,6 @@ import (
 	mathRand "math/rand"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/abolfazlalz/herald"
 	"github.com/abolfazlalz/herald/transport"
@@ -65,7 +64,6 @@ func main() {
 	fmt.Println("⌨️ Type your message and press Enter (`exit` 🚪 to quit)")
 
 	for {
-		// انتخاب نوع ارسال
 		fmt.Println("\n🔹 Choose sending mode: [1] Broadcast to all, [2] Send to specific peer, [3] Random peer")
 		fmt.Print("Mode: ")
 		modeInput, _ := reader.ReadString('\n')
@@ -123,7 +121,7 @@ func main() {
 				slog.Error("❌ Failed to marshal payload", "error", err)
 				continue
 			}
-			err = h.SendAndWait(ctx, peers[index], payload, time.Second*2)
+			err = h.SendToPeer(ctx, peers[index], payload)
 
 			if err != nil {
 				fmt.Println("⚠️ Failed to send message ❌")
@@ -144,7 +142,7 @@ func main() {
 				continue
 			}
 
-			err = h.SendAndWait(ctx, peerID, payload, time.Second*1)
+			err = h.SendToPeer(ctx, peerID, payload)
 
 			if err != nil {
 				fmt.Println("⚠️ Failed to send message ❌")

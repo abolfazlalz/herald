@@ -2,10 +2,12 @@ package herald
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/abolfazlalz/herald/internal/acknowledge"
 	"github.com/abolfazlalz/herald/internal/handshake"
 	"github.com/abolfazlalz/herald/internal/message"
+	"github.com/abolfazlalz/herald/internal/registry"
 )
 
 // Handler defines the interface that any message handler must implement.
@@ -31,7 +33,18 @@ func handleAnnounce() handlerFunc {
 
 		h.callPeerJoinHook(ctx, env.SenderID)
 
-		return h.startHandshake(ctx)
+		msg, err := handshake.InitiateHandshake(h.id, h.kp, h.signer)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Handshake initiating")
+		msg.ReceiverID = env.SenderID
+		if err := h.sendAndWait(ctx, msg, PeerConnectingTimeout); err != nil {
+			return err
+		}
+		fmt.Println("Handshake initiated")
+		h.registry.ChangePeerStatus(h.id, registry.PeerStatusConnected)
+		return nil
 	}
 }
 
@@ -48,7 +61,7 @@ func handleHeartbeat() handlerFunc {
 func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
 		msgCh <- Message{
-			ID:      env.ID,
+			ID:      env.CorrelationID,
 			From:    env.SenderID,
 			To:      env.ReceiverID,
 			Type:    MessageTypeMessage,

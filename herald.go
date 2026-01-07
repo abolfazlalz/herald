@@ -3,7 +3,6 @@ package herald
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -22,7 +21,9 @@ import (
 
 const (
 	// PeerTimeout defines the duration after which a peer is considered offline.
-	PeerTimeout = 5 * time.Second
+	PeerTimeout           = 5 * time.Second
+	MessageTimeout        = 10 * time.Second
+	PeerConnectingTimeout = 2 * time.Second
 )
 
 // pendingAck represents a pending acknowledgement for a sent message.
@@ -47,6 +48,8 @@ type Herald struct {
 	mu              sync.RWMutex
 
 	pending map[string]*pendingAck
+
+	pendingPeers map[string][]chan int8
 
 	handlers map[message.EventType]handlerFunc
 
@@ -79,6 +82,7 @@ func New(transport transport.Transport) (*Herald, error) {
 		subs:            make(map[MessageType][]chan Message),
 		sendMessageChan: make(chan *message.Envelope),
 		pending:         make(map[string]*pendingAck),
+		pendingPeers:    make(map[string][]chan int8),
 	}
 	h.handlers = map[message.EventType]handlerFunc{
 		message.EventAnnounce:  handleAnnounce(),
@@ -150,7 +154,6 @@ func (h *Herald) handleReceiveMessages(ctx context.Context) {
 		case msg := <-h.receiveMsgCh:
 			h.notify(msg.Type, msg)
 		case <-ctx.Done():
-			log.Println("message handler stopped:", ctx.Err())
 			return
 		}
 	}
@@ -171,6 +174,18 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 // publish signs, marshals, and sends a message envelope either directly or as broadcast.
 // It also registers the message in the pending ack map.
 func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
+	// if env.ReceiverID != "" && env.Type == message.EventMessage {
+	// 	peer, ok := h.registry.PeerByID(env.ReceiverID)
+	// 	if ok && peer.Status != registry.PeerStatusConnected {
+	// 		select {
+	// 		case <-ctx.Done():
+	// 			return ctx.Err()
+	// 		case <-h.registry.Wait(env.ReceiverID):
+	// 		case <-time.After(MessageTimeout):
+	// 			return ErrMessageTimeout
+	// 		}
+	// 	}
+	// }
 	if err := env.Sign(h.signer); err != nil {
 		return fmt.Errorf("envelope sign failed: %v", err)
 	}
@@ -189,10 +204,6 @@ func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 		return err
 	}
 
-	ack := make(chan struct{})
-	h.mu.Lock()
-	h.pending[env.ID] = &pendingAck{ch: ack}
-	h.mu.Unlock()
 	return nil
 }
 
@@ -207,16 +218,16 @@ func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 }
 
 // handleAck sends an acknowledgement for a received message.
-func (h *Herald) handleAck(_ context.Context, env message.Envelope) error {
-	if env.Type != message.EventMessage {
+func (h *Herald) handleAck(ctx context.Context, env message.Envelope) error {
+	if env.Type == message.EventHeartbeat {
 		return nil
 	}
 
-	ackEnv, err := acknowledge.InitiateAcknowledge(h.ID(), env.SenderID, env.ID, "OK")
+	ackEnv, err := acknowledge.InitiateAcknowledge(h.ID(), env.SenderID, env.CorrelationID, "OK")
 	if err != nil {
 		return err
 	}
-	h.sendMessageChan <- ackEnv
+	h.send(ctx, ackEnv)
 	return nil
 }
 
@@ -244,13 +255,13 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 			return nil
 		}
 		if err := middleware(msgCtx, h, &env); err != nil {
-			return fmt.Errorf("error in middleware: %v", err)
+			return fmt.Errorf("error in middleware: %v -> %v", err, env.Type)
 		}
 	}
 
 	handler, ok := h.handlers[env.Type]
 	if !ok {
-		return errors.New("invalid event type")
+		return ErrInvalidEventType
 	}
 	if err := handler(msgCtx, h, &env); err != nil {
 		return fmt.Errorf("error during handle envelope action: %v", err)
@@ -328,36 +339,50 @@ func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload []byte) 
 	if !ok {
 		return ErrUnknownPeer
 	}
+	if peerID == h.ID() {
+		return ErrSelfMessage
+	}
 
-	msg := message.NewEnvelope(message.EventMessage, h.ID(), peerID, payload)
-	h.send(msg)
+	env := message.NewEnvelope(message.EventMessage, h.ID(), peerID, payload)
+	if err := h.sendAndWait(ctx, env, MessageTimeout); err != nil {
+		return err
+	}
 	return nil
 }
 
 // send pushes a message envelope into the sendMessageChan.
-func (h *Herald) send(msg *message.Envelope) {
-	h.sendMessageChan <- msg
+func (h *Herald) send(ctx context.Context, msg *message.Envelope) {
+	select {
+	case <-ctx.Done():
+		return
+	case h.sendMessageChan <- msg:
+	}
+}
+
+// sendAndWait sends a envelope to a specific peer.
+func (h *Herald) sendAndWait(ctx context.Context, msg *message.Envelope, timeout time.Duration) error {
+	log.Printf("sending message %s to %s", msg.Type, msg.ReceiverID)
+	ack := make(chan struct{})
+	h.mu.Lock()
+	h.pending[msg.CorrelationID] = &pendingAck{ch: ack}
+	h.mu.Unlock()
+
+	h.send(ctx, msg)
+
+	select {
+	case <-h.pending[msg.CorrelationID].ch:
+		return nil
+	case <-time.After(timeout):
+		return ErrAckTimeout
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Broadcast sends a message to all peers.
 func (h *Herald) Broadcast(ctx context.Context, payload []byte) {
-	h.sendMessageChan <- message.NewEnvelope(message.EventMessage, h.ID(), "", payload)
-}
-
-// SendAndWait sends a message to a peer and waits for an acknowledgement or timeout.
-func (h *Herald) SendAndWait(ctx context.Context, peerID string, payload []byte, timeout time.Duration) error {
-	msg := message.NewEnvelope(message.EventMessage, h.ID(), peerID, payload)
-
-	h.publish(ctx, msg)
-
-	select {
-	case <-h.pending[msg.ID].ch:
-		return nil
-	case <-time.After(timeout):
-		return errors.New("ack timeout")
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	env := message.NewEnvelope(message.EventMessage, h.ID(), "", payload)
+	h.send(ctx, env)
 }
 
 // Subscribe subscribes to a specific message type with a buffered channel.

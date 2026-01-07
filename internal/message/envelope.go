@@ -19,26 +19,26 @@ const (
 
 // Envelope structure
 type Envelope struct {
-	ID         string    `json:"id"`
-	Version    int       `json:"version"`
-	Type       EventType `json:"type"`
-	SenderID   string    `json:"sender_id"`
-	ReceiverID string    `json:"receiver_id,omitempty"`
-	Timestamp  int64     `json:"timestamp"`
-	Payload    []byte    `json:"payload"`
-	Signature  []byte    `json:"signature,omitempty"`
+	CorrelationID string    `json:"id"`
+	Version       int       `json:"version"`
+	Type          EventType `json:"type"`
+	SenderID      string    `json:"sender_id"`
+	ReceiverID    string    `json:"receiver_id,omitempty"`
+	Timestamp     int64     `json:"timestamp"`
+	Payload       []byte    `json:"payload"`
+	Signature     []byte    `json:"signature,omitempty"`
 }
 
 // NewEnvelope creates a new Envelope
 func NewEnvelope(eventType EventType, senderID string, receiverID string, payload []byte) *Envelope {
 	return &Envelope{
-		ID:         uuid.New().String(),
-		Version:    1,
-		Type:       eventType,
-		SenderID:   senderID,
-		ReceiverID: receiverID,
-		Timestamp:  time.Now().Unix(),
-		Payload:    payload,
+		CorrelationID: uuid.New().String(),
+		Version:       1,
+		Type:          eventType,
+		SenderID:      senderID,
+		ReceiverID:    receiverID,
+		Timestamp:     time.Now().Unix(),
+		Payload:       payload,
 	}
 }
 
