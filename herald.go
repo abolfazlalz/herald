@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,7 +25,7 @@ const (
 	// PeerTimeout defines the duration after which a peer is considered offline.
 	PeerTimeout           = 5 * time.Second
 	MessageTimeout        = 10 * time.Second
-	PeerConnectingTimeout = 2 * time.Second
+	PeerConnectingTimeout = 5 * time.Second
 )
 
 // pendingAck represents a pending acknowledgement for a sent message.
@@ -164,6 +166,7 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 	for {
 		select {
 		case msg := <-h.sendMessageChan:
+			slog.Info("handle send message", "type", msg.Type)
 			h.publish(ctx, msg)
 		case <-ctx.Done():
 			return
@@ -174,18 +177,7 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 // publish signs, marshals, and sends a message envelope either directly or as broadcast.
 // It also registers the message in the pending ack map.
 func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
-	// if env.ReceiverID != "" && env.Type == message.EventMessage {
-	// 	peer, ok := h.registry.PeerByID(env.ReceiverID)
-	// 	if ok && peer.Status != registry.PeerStatusConnected {
-	// 		select {
-	// 		case <-ctx.Done():
-	// 			return ctx.Err()
-	// 		case <-h.registry.Wait(env.ReceiverID):
-	// 		case <-time.After(MessageTimeout):
-	// 			return ErrMessageTimeout
-	// 		}
-	// 	}
-	// }
+	slog.Info("call publish", "type", env.Type, "payload", env.Payload, "id", env.ReceiverID)
 	if err := env.Sign(h.signer); err != nil {
 		return fmt.Errorf("envelope sign failed: %v", err)
 	}
@@ -211,7 +203,7 @@ func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 	for data := range dataCh {
 		if err := h.executeMessage(ctx, data); err != nil {
-			log.Printf("error during execute message: %v", err)
+			slog.Error("error during execute message", "error", err.Error())
 		}
 	}
 	return nil
@@ -219,14 +211,12 @@ func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 
 // handleAck sends an acknowledgement for a received message.
 func (h *Herald) handleAck(ctx context.Context, env message.Envelope) error {
-	if env.Type == message.EventHeartbeat {
-		return nil
-	}
-
+	slog.Info("handleAck", "type", env.Type, "correlation_id", env.CorrelationID)
 	ackEnv, err := acknowledge.InitiateAcknowledge(h.ID(), env.SenderID, env.CorrelationID, "OK")
 	if err != nil {
 		return err
 	}
+	slog.Info("handleAck Send", "type", env.Type, "correlation_id", env.CorrelationID)
 	h.send(ctx, ackEnv)
 	return nil
 }
@@ -259,6 +249,8 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 		}
 	}
 
+	slog.Info("execute message", "correlation_id", env.CorrelationID, "type", env.Type)
+
 	handler, ok := h.handlers[env.Type]
 	if !ok {
 		return ErrInvalidEventType
@@ -267,7 +259,9 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 		return fmt.Errorf("error during handle envelope action: %v", err)
 	}
 
-	h.handleAck(ctx, env)
+	if !slices.Contains([]message.EventType{message.EventHeartbeat, message.EventAck}, env.Type) {
+		h.handleAck(ctx, env)
+	}
 	return nil
 }
 
@@ -323,8 +317,8 @@ func (h *Herald) Start(ctx context.Context) error {
 		return err
 	}
 
-	go h.startHeartbeatPublisher(ctx)
-	go h.startCheckHeartbeats(ctx)
+	// go h.startHeartbeatPublisher(ctx)
+	// go h.startCheckHeartbeats(ctx)
 	go h.handleReceiveMessages(ctx)
 	go h.handleSendMessages(ctx)
 
@@ -361,20 +355,37 @@ func (h *Herald) send(ctx context.Context, msg *message.Envelope) {
 
 // sendAndWait sends a envelope to a specific peer.
 func (h *Herald) sendAndWait(ctx context.Context, msg *message.Envelope, timeout time.Duration) error {
-	log.Printf("sending message %s to %s", msg.Type, msg.ReceiverID)
+	slog.Info("start sending message", "type", msg.Type, "receiver_id", msg.ReceiverID, "method", "sendAndWait", "correlation_id", msg.CorrelationID)
+
+	if msg.ReceiverID != "" && msg.Type == message.EventMessage && msg.Type != message.EventAck {
+		peer, ok := h.registry.PeerByID(msg.ReceiverID)
+		if ok && peer.Status != registry.PeerStatusConnected {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-h.registry.Wait(msg.ReceiverID):
+			case <-time.After(MessageTimeout):
+				slog.Error("send timeout", "correlation_id", msg.CorrelationID, "type", msg.Type)
+				return ErrMessageTimeout
+			}
+		}
+	}
+
 	ack := make(chan struct{})
 	h.mu.Lock()
 	h.pending[msg.CorrelationID] = &pendingAck{ch: ack}
 	h.mu.Unlock()
 
-	h.send(ctx, msg)
+	go h.send(ctx, msg)
 
 	select {
 	case <-h.pending[msg.CorrelationID].ch:
+		slog.Info("correlationID has completed", "correlation_id", msg.CorrelationID)
 		return nil
 	case <-time.After(timeout):
 		return ErrAckTimeout
 	case <-ctx.Done():
+		fmt.Println("context done:", ctx.Err())
 		return ctx.Err()
 	}
 }

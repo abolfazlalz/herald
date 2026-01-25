@@ -2,7 +2,7 @@ package herald
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 
 	"github.com/abolfazlalz/herald/internal/acknowledge"
 	"github.com/abolfazlalz/herald/internal/handshake"
@@ -37,13 +37,15 @@ func handleAnnounce() handlerFunc {
 		if err != nil {
 			return err
 		}
-		fmt.Println("Handshake initiating")
-		msg.ReceiverID = env.SenderID
-		if err := h.sendAndWait(ctx, msg, PeerConnectingTimeout); err != nil {
-			return err
-		}
-		fmt.Println("Handshake initiated")
-		h.registry.ChangePeerStatus(h.id, registry.PeerStatusConnected)
+		go func() {
+			slog.Info("Handshake initiating")
+			msg.ReceiverID = env.SenderID
+			if err := h.sendAndWait(ctx, msg, PeerConnectingTimeout); err != nil {
+				return
+			}
+			slog.Info("Handshake initiated")
+			h.registry.ChangePeerStatus(env.SenderID, registry.PeerStatusConnected)
+		}()
 		return nil
 	}
 }
@@ -60,6 +62,7 @@ func handleHeartbeat() handlerFunc {
 // It pushes the incoming message onto the provided channel for processing.
 func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
+		slog.Info("handle message", "correlation_id", env.CorrelationID, "from", env.SenderID)
 		msgCh <- Message{
 			ID:      env.CorrelationID,
 			From:    env.SenderID,
