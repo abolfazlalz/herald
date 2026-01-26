@@ -56,10 +56,16 @@ type Herald struct {
 	handlers map[message.EventType]handlerFunc
 
 	hooks Hook
+
+	logger Log
+}
+
+type Option struct {
+	Logger Log
 }
 
 // New creates a new Herald instance, generating a key pair and setting up default handlers.
-func New(transport transport.Transport) (*Herald, error) {
+func New(transport transport.Transport, opts *Option) (*Herald, error) {
 	id := uuid.New().String()
 
 	kp, err := security.Generate()
@@ -71,6 +77,13 @@ func New(transport transport.Transport) (*Herald, error) {
 	signer, err := security.NewSigner(kp)
 	if err != nil {
 		return nil, err
+	}
+
+	var logger Log
+	if opts == nil || opts.Logger == nil {
+		logger = NewLogger(&slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		logger = opts.Logger
 	}
 
 	h := &Herald{
@@ -85,6 +98,7 @@ func New(transport transport.Transport) (*Herald, error) {
 		sendMessageChan: make(chan *message.Envelope),
 		pending:         make(map[string]*pendingAck),
 		pendingPeers:    make(map[string][]chan int8),
+		logger:          logger,
 	}
 	h.handlers = map[message.EventType]handlerFunc{
 		message.EventAnnounce:  handleAnnounce(),
@@ -166,7 +180,7 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 	for {
 		select {
 		case msg := <-h.sendMessageChan:
-			slog.Info("handle send message", "type", msg.Type)
+			h.logger.Info(ctx, "handle send message", "type", msg.Type)
 			h.publish(ctx, msg)
 		case <-ctx.Done():
 			return
@@ -177,7 +191,9 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 // publish signs, marshals, and sends a message envelope either directly or as broadcast.
 // It also registers the message in the pending ack map.
 func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
-	slog.Info("call publish", "type", env.Type, "payload", env.Payload, "id", env.ReceiverID)
+	if env.Type != message.EventHeartbeat {
+		h.logger.Info(ctx, "call publish", "type", env.Type, "id", env.ReceiverID)
+	}
 	if err := env.Sign(h.signer); err != nil {
 		return fmt.Errorf("envelope sign failed: %v", err)
 	}
@@ -202,8 +218,14 @@ func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 // subscribe listens to incoming raw messages and executes them.
 func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 	for data := range dataCh {
-		if err := h.executeMessage(ctx, data); err != nil {
-			slog.Error("error during execute message", "error", err.Error())
+		var env message.Envelope
+		if err := json.Unmarshal(data, &env); err != nil {
+			h.logger.Error(ctx, "error during execute message", "error", err.Error())
+			continue
+		}
+
+		if err := h.executeMessage(ctx, env); err != nil {
+			h.logger.Error(ctx, "error during execute message", "error", err.Error(), "type", env.Type, "correlation_id", env.CorrelationID, "sender", env.SenderID)
 		}
 	}
 	return nil
@@ -211,23 +233,18 @@ func (h *Herald) subscribe(ctx context.Context, dataCh <-chan []byte) error {
 
 // handleAck sends an acknowledgement for a received message.
 func (h *Herald) handleAck(ctx context.Context, env message.Envelope) error {
-	slog.Info("handleAck", "type", env.Type, "correlation_id", env.CorrelationID)
+	h.logger.Debug(ctx, "handleAck", "type", env.Type, "correlation_id", env.CorrelationID)
 	ackEnv, err := acknowledge.InitiateAcknowledge(h.ID(), env.SenderID, env.CorrelationID, "OK")
 	if err != nil {
 		return err
 	}
-	slog.Info("handleAck Send", "type", env.Type, "correlation_id", env.CorrelationID)
+	h.logger.Debug(ctx, "handleAck Send", "type", env.Type, "correlation_id", env.CorrelationID)
 	h.send(ctx, ackEnv)
 	return nil
 }
 
 // executeMessage runs middleware and handler functions for an incoming message.
-func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
-	var env message.Envelope
-	if err := json.Unmarshal(data, &env); err != nil {
-		return fmt.Errorf("error in unmarshal message: %v", err)
-	}
-
+func (h *Herald) executeMessage(ctx context.Context, env message.Envelope) error {
 	if h.id == env.SenderID {
 		return nil
 	}
@@ -245,11 +262,13 @@ func (h *Herald) executeMessage(ctx context.Context, data []byte) error {
 			return nil
 		}
 		if err := middleware(msgCtx, h, &env); err != nil {
-			return fmt.Errorf("error in middleware: %v -> %v", err, env.Type)
+			return fmt.Errorf("error in middleware: %s", err.Error())
 		}
 	}
 
-	slog.Info("execute message", "correlation_id", env.CorrelationID, "type", env.Type)
+	if env.Type != message.EventHeartbeat {
+		h.logger.Info(ctx, "execute message", "correlation_id", env.CorrelationID, "type", env.Type, "payload", string(env.Payload), "sender", env.SenderID)
+	}
 
 	handler, ok := h.handlers[env.Type]
 	if !ok {
@@ -300,6 +319,7 @@ func (h *Herald) Start(ctx context.Context) error {
 			h.transport.Close()
 		}
 	}()
+	h.logger.Debug(ctx, "Service started", "ID", h.ID())
 
 	bc, err := h.transport.SubscribeBroadcast(ctx)
 	if err != nil {
@@ -317,8 +337,8 @@ func (h *Herald) Start(ctx context.Context) error {
 		return err
 	}
 
-	// go h.startHeartbeatPublisher(ctx)
-	// go h.startCheckHeartbeats(ctx)
+	go h.startHeartbeatPublisher(ctx)
+	go h.startCheckHeartbeats(ctx)
 	go h.handleReceiveMessages(ctx)
 	go h.handleSendMessages(ctx)
 
@@ -331,6 +351,7 @@ func (h *Herald) Start(ctx context.Context) error {
 func (h *Herald) SendToPeer(ctx context.Context, peerID string, payload []byte) error {
 	_, ok := h.registry.PeerByID(peerID)
 	if !ok {
+		h.logger.Debug(ctx, "sendToPeer unknown peer given", "payload", string(payload), "peer_id", peerID)
 		return ErrUnknownPeer
 	}
 	if peerID == h.ID() {
@@ -355,7 +376,7 @@ func (h *Herald) send(ctx context.Context, msg *message.Envelope) {
 
 // sendAndWait sends a envelope to a specific peer.
 func (h *Herald) sendAndWait(ctx context.Context, msg *message.Envelope, timeout time.Duration) error {
-	slog.Info("start sending message", "type", msg.Type, "receiver_id", msg.ReceiverID, "method", "sendAndWait", "correlation_id", msg.CorrelationID)
+	h.logger.Debug(ctx, "start sending message", "type", msg.Type, "peer_id", msg.ReceiverID, "method", "sendAndWait", "correlation_id", msg.CorrelationID, "payload", string(msg.Payload))
 
 	if msg.ReceiverID != "" && msg.Type == message.EventMessage && msg.Type != message.EventAck {
 		peer, ok := h.registry.PeerByID(msg.ReceiverID)
@@ -365,7 +386,7 @@ func (h *Herald) sendAndWait(ctx context.Context, msg *message.Envelope, timeout
 				return ctx.Err()
 			case <-h.registry.Wait(msg.ReceiverID):
 			case <-time.After(MessageTimeout):
-				slog.Error("send timeout", "correlation_id", msg.CorrelationID, "type", msg.Type)
+				h.logger.Error(ctx, "send timeout", "correlation_id", msg.CorrelationID, "type", msg.Type)
 				return ErrMessageTimeout
 			}
 		}
@@ -380,12 +401,11 @@ func (h *Herald) sendAndWait(ctx context.Context, msg *message.Envelope, timeout
 
 	select {
 	case <-h.pending[msg.CorrelationID].ch:
-		slog.Info("correlationID has completed", "correlation_id", msg.CorrelationID)
+		h.logger.Debug(ctx, "correlationID has completed", "correlation_id", msg.CorrelationID)
 		return nil
 	case <-time.After(timeout):
 		return ErrAckTimeout
 	case <-ctx.Done():
-		fmt.Println("context done:", ctx.Err())
 		return ctx.Err()
 	}
 }

@@ -2,7 +2,7 @@ package herald
 
 import (
 	"context"
-	"log/slog"
+	"time"
 
 	"github.com/abolfazlalz/herald/internal/acknowledge"
 	"github.com/abolfazlalz/herald/internal/handshake"
@@ -31,20 +31,19 @@ func handleAnnounce() handlerFunc {
 			return err
 		}
 
-		h.callPeerJoinHook(ctx, env.SenderID)
-
 		msg, err := handshake.InitiateHandshake(h.id, h.kp, h.signer)
 		if err != nil {
 			return err
 		}
 		go func() {
-			slog.Info("Handshake initiating")
+			h.logger.Info(ctx, "Handshake initiating")
 			msg.ReceiverID = env.SenderID
 			if err := h.sendAndWait(ctx, msg, PeerConnectingTimeout); err != nil {
 				return
 			}
-			slog.Info("Handshake initiated")
+			h.logger.Info(ctx, "Handshake initiated")
 			h.registry.ChangePeerStatus(env.SenderID, registry.PeerStatusConnected)
+			h.callPeerJoinHook(ctx, env.SenderID)
 		}()
 		return nil
 	}
@@ -62,13 +61,19 @@ func handleHeartbeat() handlerFunc {
 // It pushes the incoming message onto the provided channel for processing.
 func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
-		slog.Info("handle message", "correlation_id", env.CorrelationID, "from", env.SenderID)
-		msgCh <- Message{
+		h.logger.Info(ctx, "send env to message channel", "correlation_id", env.CorrelationID, "from", env.SenderID)
+		msg := Message{
 			ID:      env.CorrelationID,
 			From:    env.SenderID,
 			To:      env.ReceiverID,
 			Type:    MessageTypeMessage,
 			Payload: env.Payload,
+		}
+		select {
+		case msgCh <- msg:
+			h.logger.Debug(ctx, "env has sent to message channel", "correlation_id", env.CorrelationID, "from", env.SenderID)
+		case <-time.After(time.Second):
+			h.logger.Error(ctx, "timeout: send env to message channel", "correlation_id", env.CorrelationID, "from", env.SenderID)
 		}
 		return nil
 	}

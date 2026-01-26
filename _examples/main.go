@@ -26,7 +26,7 @@ func main() {
 	defer transport.Close()
 
 	ctx := context.Background()
-	h, err := herald.New(transport)
+	h, err := herald.New(transport, nil)
 	if err != nil {
 		slog.Error("❌ Herald initialization failed", "error", err)
 		return
