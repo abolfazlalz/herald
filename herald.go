@@ -44,7 +44,7 @@ type Herald struct {
 	verifier security.Verifier
 	registry *registry.PeerRegistry
 
-	subs            map[MessageType][]chan Message
+	subs            map[MessageType][]HandlerFunc
 	receiveMsgCh    chan Message
 	sendMessageChan chan *message.Envelope
 	mu              sync.RWMutex
@@ -94,7 +94,7 @@ func New(transport transport.Transport, opts *Option) (*Herald, error) {
 		signer:          signer,
 		registry:        registry.NewPeerRegistry(),
 		receiveMsgCh:    make(chan Message),
-		subs:            make(map[MessageType][]chan Message),
+		subs:            make(map[MessageType][]HandlerFunc),
 		sendMessageChan: make(chan *message.Envelope),
 		pending:         make(map[string]*pendingAck),
 		pendingPeers:    make(map[string][]chan int8),
@@ -168,7 +168,7 @@ func (h *Herald) handleReceiveMessages(ctx context.Context) {
 	for {
 		select {
 		case msg := <-h.receiveMsgCh:
-			h.notify(msg.Type, msg)
+			h.notify(ctx, msg.Type, &msg)
 		case <-ctx.Done():
 			return
 		}
@@ -285,15 +285,12 @@ func (h *Herald) executeMessage(ctx context.Context, env message.Envelope) error
 }
 
 // notify sends a message to all subscribers of a specific event type.
-func (h *Herald) notify(event MessageType, msg Message) {
+func (h *Herald) notify(ctx context.Context, event MessageType, msg *Message) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
 	for _, sub := range h.subs[event] {
-		select {
-		case sub <- msg:
-		default:
-		}
+		go sub(NewMessageContext(ctx), msg)
 	}
 }
 
@@ -417,22 +414,10 @@ func (h *Herald) Broadcast(ctx context.Context, payload []byte) {
 }
 
 // Subscribe subscribes to a specific message type with a buffered channel.
-func (h *Herald) Subscribe(ctx context.Context, event MessageType, buffer int) Subscription {
-	ch := make(chan Message, buffer)
-
+func (h *Herald) Subscribe(ctx context.Context, event MessageType, handler HandlerFunc) {
 	h.mu.Lock()
-	h.subs[event] = append(h.subs[event], ch)
+	h.subs[event] = append(h.subs[event], handler)
 	h.mu.Unlock()
-
-	go func() {
-		<-ctx.Done()
-		close(ch)
-	}()
-
-	return Subscription{
-		C:      ch,
-		cancel: func() { close(ch) },
-	}
 }
 
 // ID returns the unique identifier of this Herald instance.

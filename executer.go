@@ -10,8 +10,8 @@ import (
 	"github.com/abolfazlalz/herald/internal/registry"
 )
 
-// Handler defines the interface that any message handler must implement.
-type Handler interface {
+// internalHandler defines the interface that any message handler must implement.
+type internalHandler interface {
 	Handle(context.Context, *Herald, *message.Envelope) error
 }
 

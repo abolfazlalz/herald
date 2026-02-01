@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 
 	"github.com/abolfazlalz/herald"
@@ -41,8 +42,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	// h, err := herald.New(transport, &herald.Option{Logger: herald.NewLogger(&slog.HandlerOptions{Level: slog.LevelError})})
-	h, err := herald.New(transport, nil)
+	h, err := herald.New(transport, &herald.Option{Logger: herald.NewLogger(&slog.HandlerOptions{Level: slog.LevelError})})
+	// h, err := herald.New(transport, nil)
 	// h, err := herald.New(transport, &herald.Option{Logger: herald.NewLogs(slog.New(slog.NewJSONHandler(os.Stdout, nil)))})
 	if err != nil {
 		log.Fatal(err)
@@ -55,15 +56,12 @@ func main() {
 
 	ctx := context.Background()
 
-	sub := h.Subscribe(ctx, herald.MessageTypeMessage, 0)
-	go func() {
-		for msg := range sub.C {
-			PrintColorable(blue, "Message received:", string(msg.Payload))
-			if string(msg.Payload) == "Hello, peer!" {
-				Send(ctx, h, msg.From, "nice to meet you, peer!")
-			}
+	h.Subscribe(ctx, herald.MessageTypeMessage, func(mc *herald.MessageContext, msg *herald.Message) {
+		PrintColorable(blue, "Message received:", string(msg.Payload))
+		if string(msg.Payload) == "Hello, peer!" {
+			Send(ctx, h, msg.From, "nice to meet you, peer!")
 		}
-	}()
+	})
 
 	if err := h.Start(ctx); err != nil {
 		panic(err)
