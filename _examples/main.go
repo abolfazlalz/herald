@@ -3,18 +3,20 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	mathRand "math/rand"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/abolfazlalz/herald"
 	"github.com/abolfazlalz/herald/transport"
 )
+
+type Payload struct {
+	Message string `json:"message"`
+}
 
 func main() {
 	transport, err := transport.NewRabbitMQ("amqp://guest:guest@localhost:5672/", "events")
@@ -23,13 +25,12 @@ func main() {
 	}
 	defer transport.Close()
 
-	_, pri, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		slog.Error("🔐 Key generation failed", "error", err)
-	}
-
 	ctx := context.Background()
-	h := herald.New(transport, pri)
+	h, err := herald.New(transport, nil)
+	if err != nil {
+		slog.Error("❌ Herald initialization failed", "error", err)
+		return
+	}
 
 	fmt.Println("🆔 Cluster ID:", h.ID())
 
@@ -50,7 +51,12 @@ func main() {
 	go func() {
 		sub := h.Subscribe(ctx, herald.MessageTypeMessage, 10)
 		for msg := range sub.C {
-			fmt.Println("📩 Incoming message:", msg.Payload["message"])
+			var payload Payload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				slog.Error("❌ Failed to unmarshal payload", "error", err)
+				continue
+			}
+			fmt.Println("📩 Incoming message:", payload.Message)
 		}
 	}()
 
@@ -58,7 +64,6 @@ func main() {
 	fmt.Println("⌨️ Type your message and press Enter (`exit` 🚪 to quit)")
 
 	for {
-		// انتخاب نوع ارسال
 		fmt.Println("\n🔹 Choose sending mode: [1] Broadcast to all, [2] Send to specific peer, [3] Random peer")
 		fmt.Print("Mode: ")
 		modeInput, _ := reader.ReadString('\n')
@@ -78,7 +83,13 @@ func main() {
 				fmt.Println("👋 Shutting down…")
 				return
 			}
-			h.SendMessage(ctx, msg)
+			payload, err := json.Marshal(Payload{Message: msg})
+			if err != nil {
+				slog.Error("❌ Failed to marshal payload", "error", err)
+				continue
+			}
+
+			h.Broadcast(ctx, payload)
 			fmt.Println("📤 Your message has been sent to all ✅")
 
 		case "2":
@@ -105,10 +116,12 @@ func main() {
 			fmt.Print("📨 Enter your message: ")
 			msg, _ := reader.ReadString('\n')
 			msg = strings.TrimSpace(msg)
-			err := h.SendAndWait(ctx, peers[index], map[string]any{
-				"key":     "direct",
-				"message": msg,
-			}, time.Second*2)
+			payload, err := json.Marshal(Payload{Message: msg})
+			if err != nil {
+				slog.Error("❌ Failed to marshal payload", "error", err)
+				continue
+			}
+			err = h.SendToPeer(ctx, peers[index], payload)
 
 			if err != nil {
 				fmt.Println("⚠️ Failed to send message ❌")
@@ -123,10 +136,13 @@ func main() {
 				continue
 			}
 			peerID := peers[mathRand.Intn(len(peers))]
-			err := h.SendAndWait(ctx, peerID, map[string]any{
-				"key":     "random",
-				"message": "🎲 Random message sent!",
-			}, time.Second*1)
+			payload, err := json.Marshal(Payload{Message: "🎲 Random message sent!"})
+			if err != nil {
+				slog.Error("❌ Failed to marshal payload", "error", err)
+				continue
+			}
+
+			err = h.SendToPeer(ctx, peerID, payload)
 
 			if err != nil {
 				fmt.Println("⚠️ Failed to send message ❌")

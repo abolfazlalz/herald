@@ -8,10 +8,30 @@ import (
 	"github.com/abolfazlalz/herald/internal/timeutil"
 )
 
+type PeerStatus int
+
+const (
+	PeerStatusConnected PeerStatus = iota
+	PeerStatusConnecting
+	PeerStatusDisconnected
+)
+
 type Peer struct {
 	LastOnline time.Time
+	Status     PeerStatus
 	PublicKey  []byte
 	RouteKey   string
+	WaitList   []chan int
+}
+
+func NewPeer(id string, pubkey []byte, routeKey string, lastOnline time.Time, status PeerStatus) *Peer {
+	return &Peer{
+		LastOnline: lastOnline,
+		Status:     status,
+		PublicKey:  pubkey,
+		RouteKey:   routeKey,
+		WaitList:   make([]chan int, 0),
+	}
 }
 
 type PeerRegistry struct {
@@ -64,14 +84,37 @@ func (r *PeerRegistry) UpdateLastOnline(ID string) {
 func (r *PeerRegistry) Add(id string, pubkey []byte, routeKey string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.peers[id] = &Peer{
-		LastOnline: r.clock.Now(),
-		PublicKey:  pubkey,
-	}
+	r.peers[id] = NewPeer(id, pubkey, routeKey, r.clock.Now(), PeerStatusConnecting)
 }
 
 func (r *PeerRegistry) Remove(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.peers, id)
+}
+
+func (r *PeerRegistry) Wait(id string) chan int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.peers[id]; !ok {
+		return nil
+	}
+	ch := make(chan int, 1)
+	r.peers[id].WaitList = append(r.peers[id].WaitList, ch)
+	return ch
+}
+
+func (r *PeerRegistry) ChangePeerStatus(id string, status PeerStatus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.peers[id]; !ok {
+		return
+	}
+	if status == PeerStatusConnected {
+		for _, ch := range r.peers[id].WaitList {
+			ch <- 1
+		}
+		r.peers[id].WaitList = make([]chan int, 0)
+	}
+	r.peers[id].Status = status
 }

@@ -17,11 +17,12 @@ func UpdateLastOnline() Middleware {
 
 func VerifySignature() Middleware {
 	return func(ctx *MessageContext, h *Herald, env *message.Envelope) error {
-		if env.Type == message.EventAnnounce {
+		if env.Type == message.EventAnnounce || env.Type == message.EventAck {
 			return nil
 		}
 		peer, ok := h.registry.PeerByID(env.SenderID)
 		if !ok {
+			h.logger.Debug(ctx, "verifySignature unknown peer", "correlation_id", env.CorrelationID, "sender", env.SenderID)
 			return ErrUnknownPeer
 		}
 
@@ -34,7 +35,8 @@ func VerifySignature() Middleware {
 
 func CheckMessageAccess() Middleware {
 	return func(ctx *MessageContext, h *Herald, env *message.Envelope) error {
-		if env.ReceiverID != "" && env.ReceiverID != h.ID() {
+		if env.ReceiverID != "" && env.ReceiverID != h.ID() && env.Type != message.EventAck {
+			h.logger.Debug(ctx, "sender not allowed", "correlation_id", env.CorrelationID, "sender", env.SenderID)
 			ctx.Abort()
 			return nil
 		}
