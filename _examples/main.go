@@ -49,15 +49,14 @@ func main() {
 	}()
 
 	go func() {
-		sub := h.Subscribe(ctx, herald.MessageTypeMessage, 10)
-		for msg := range sub.C {
+		h.Subscribe(ctx, herald.MessageTypeMessage, func(mc *herald.MessageContext, msg *herald.Message) {
 			var payload Payload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				slog.Error("❌ Failed to unmarshal payload", "error", err)
-				continue
+				return
 			}
 			fmt.Println("📩 Incoming message:", payload.Message)
-		}
+		})
 	}()
 
 	reader := bufio.NewReader(os.Stdin)
