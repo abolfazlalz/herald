@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"slices"
 	"sync"
@@ -127,7 +126,7 @@ func (h *Herald) startCheckHeartbeats(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("healthcheck stopped:", ctx.Err())
+			h.logger.Debug(ctx, "healthcheck stopped:", "error", ctx.Err())
 			return
 		case <-ticker.C:
 			for id, peer := range h.registry.Peers() {
@@ -148,16 +147,16 @@ func (h *Herald) startHeartbeatPublisher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("heartbeat publisher stopped:", ctx.Err())
+			h.logger.Debug(ctx, "heartbeat publisher stopped:", "error", ctx.Err())
 			return
 		case <-ticker.C:
 			env, err := heartbeat.InitiateHeartbeat(h.id, h.kp)
 			if err != nil {
-				log.Printf("heartbeat initiation failed: %v", err)
+				h.logger.Error(ctx, "heartbeat initiation failed", "error", err)
 				continue
 			}
 			if err := h.publish(ctx, env); err != nil {
-				log.Printf("publish heartbeat failed: %v", err)
+				h.logger.Error(ctx, "publish heartbeat failed", "error", err)
 			}
 		}
 	}
@@ -180,7 +179,7 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 	for {
 		select {
 		case msg := <-h.sendMessageChan:
-			h.logger.Info(ctx, "handle send message", "type", msg.Type)
+			h.logger.Debug(ctx, "handle send message", "type", msg.Type)
 			h.publish(ctx, msg)
 		case <-ctx.Done():
 			return
@@ -192,7 +191,7 @@ func (h *Herald) handleSendMessages(ctx context.Context) {
 // It also registers the message in the pending ack map.
 func (h *Herald) publish(ctx context.Context, env *message.Envelope) error {
 	if env.Type != message.EventHeartbeat {
-		h.logger.Info(ctx, "call publish", "type", env.Type, "id", env.ReceiverID)
+		h.logger.Debug(ctx, "call publish", "type", env.Type, "id", env.ReceiverID)
 	}
 	if err := env.Sign(h.signer); err != nil {
 		return fmt.Errorf("envelope sign failed: %v", err)
@@ -267,7 +266,7 @@ func (h *Herald) executeMessage(ctx context.Context, env message.Envelope) error
 	}
 
 	if env.Type != message.EventHeartbeat {
-		h.logger.Info(ctx, "execute message", "correlation_id", env.CorrelationID, "type", env.Type, "payload", string(env.Payload), "sender", env.SenderID)
+		h.logger.Debug(ctx, "execute message", "correlation_id", env.CorrelationID, "type", env.Type, "payload", string(env.Payload), "sender", env.SenderID)
 	}
 
 	handler, ok := h.handlers[env.Type]
@@ -316,7 +315,7 @@ func (h *Herald) Start(ctx context.Context) error {
 			h.transport.Close()
 		}
 	}()
-	h.logger.Debug(ctx, "Service started", "ID", h.ID())
+	h.logger.Info(ctx, "Service started", "ID", h.ID())
 
 	bc, err := h.transport.SubscribeBroadcast(ctx)
 	if err != nil {

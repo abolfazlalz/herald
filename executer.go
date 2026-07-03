@@ -36,7 +36,7 @@ func handleAnnounce() handlerFunc {
 			return err
 		}
 		go func() {
-			h.logger.Info(ctx, "Handshake initiating")
+			h.logger.Debug(ctx, "Handshake initiating")
 			msg.ReceiverID = env.SenderID
 			if err := h.sendAndWait(ctx, msg, PeerConnectingTimeout); err != nil {
 				return
@@ -61,7 +61,7 @@ func handleHeartbeat() handlerFunc {
 // It pushes the incoming message onto the provided channel for processing.
 func handleMessage(msgCh chan Message) handlerFunc {
 	return func(ctx context.Context, h *Herald, env *message.Envelope) error {
-		h.logger.Info(ctx, "send env to message channel", "correlation_id", env.CorrelationID, "from", env.SenderID)
+		h.logger.Debug(ctx, "send env to message channel", "correlation_id", env.CorrelationID, "from", env.SenderID)
 		msg := Message{
 			ID:      env.CorrelationID,
 			From:    env.SenderID,
